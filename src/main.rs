@@ -1,7 +1,13 @@
+use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use std::{num::ParseIntError, path::PathBuf};
-use tracing::{Level, info};
+use tracing::{Level, error, info};
 use tracing_subscriber;
+
+mod entities;
+mod filesystem;
+
+use filesystem::FileSystemManager;
 
 #[derive(Parser)]
 #[command(author, version, about, color = clap::ColorChoice::Auto)]
@@ -12,6 +18,29 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Creates a new filesystem image
+    Mkfs {
+        /// Image file path
+        #[arg(value_name = "IMAGE", value_parser = ensure_parent_exists)]
+        image: PathBuf,
+
+        /// Root dir permissions (octal, e.g. 755)
+        #[arg(long, value_parser = parse_octal, default_value = "755")]
+        mode: u32,
+
+        /// Root dir owner UID
+        #[arg(long, default_value_t = 0)]
+        uid: u32,
+
+        /// Root dir owner GID
+        #[arg(long, default_value_t = 0)]
+        gid: u32,
+
+        /// Verbosity for application logging.
+        #[arg(long, value_enum, default_value_t = LogLevel::Info)]
+        log_level: LogLevel,
+    },
+
     /// Mounts the specified DB into the specified location
     Mount {
         /// Image file path
@@ -89,6 +118,19 @@ fn parse_existing_dir(s: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+/// Creates a file system image by creating a SQLite database initialized with
+/// the right schema.
+async fn flocon_mkfs(image: PathBuf, mode: u32, uid: u32, gid: u32) -> Result<()> {
+    info!("Creating new filesystem image: {:?}", image);
+
+    let mut fs_manager = FileSystemManager::new(&image).await?;
+    fs_manager.initialize_filesystem(mode, uid, gid).await?;
+
+    info!("Successfully created filesystem image");
+    Ok(())
+}
+
+/// Mounts a flocon filesystem using FUSE on the local system
 async fn flocon_mount(
     image: PathBuf,
     mount_point: PathBuf,
@@ -96,20 +138,44 @@ async fn flocon_mount(
     uid: u32,
     gid: u32,
     daemonize: bool,
-) {
-    // Example log messages to demonstrate it's working
+) -> Result<()> {
     info!("Mounting image: {:?}", image);
     info!("Mount point: {:?}", mount_point);
     info!("Mode: {:o}, UID: {}, GID: {}", mode, uid, gid);
     info!("Daemonize: {}", daemonize);
 
-    // stub: your async mount logic here
+    let mut fs_manager = FileSystemManager::open(&image).await?;
+
+    // Ensure filesystem is initialized (runs migrations if needed)
+    fs_manager.ensure_initialized(mode, uid, gid).await?;
+
+    // TODO: Implement actual FUSE mounting logic here
+    // fs_manager.mount(&mount_point, daemonize).await?;
+
+    Ok(())
 }
 
 fn main() {
     let cli = Cli::parse();
 
+    let rt = tokio::runtime::Runtime::new().unwrap();
+
     match cli.command {
+        Commands::Mkfs {
+            image,
+            mode,
+            uid,
+            gid,
+            log_level,
+        } => {
+            let level: Level = log_level.into();
+            tracing_subscriber::fmt().with_max_level(level).init();
+
+            if let Err(e) = rt.block_on(flocon_mkfs(image, mode, uid, gid)) {
+                error!("Failed to create filesystem: {}", e);
+                std::process::exit(1);
+            }
+        }
         Commands::Mount {
             image,
             mount_point,
@@ -119,15 +185,14 @@ fn main() {
             log_level,
             daemonize,
         } => {
-            // Convert LogLevel to tracing::Level
             let level: Level = log_level.into();
-
-            // Initialize the tracing subscriber
             tracing_subscriber::fmt().with_max_level(level).init();
 
-            tokio::runtime::Runtime::new()
-                .unwrap()
-                .block_on(flocon_mount(image, mount_point, mode, uid, gid, daemonize));
+            if let Err(e) = rt.block_on(flocon_mount(image, mount_point, mode, uid, gid, daemonize))
+            {
+                error!("Failed to mount filesystem: {}", e);
+                std::process::exit(1);
+            }
         }
     }
 }

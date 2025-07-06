@@ -5,6 +5,17 @@ edition = "2024"
 
 [dependencies]
 clap = { version = "4.5", features = ["derive", "color"] }
+sea-orm = { version = "1.1", features = [ "sqlx-sqlite", "runtime-tokio-rustls", "macros" ] }
+sea-orm-migration = { version = "1.1", features = ["runtime-tokio-native-tls", "sqlx-sqlite"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio = { version = "1", features = ["full"] }
+anyhow = "1.0.98"
+chrono = "0.4.41"
+migration = { path = "migration" }
+
+[workspace]
+members = [
+    ".",
+    "migration",
+]
