@@ -1,8 +1,15 @@
 use anyhow::Result;
+use async_trait::async_trait;
 use chrono::Utc;
+use fuse_backend_rs::abi::fuse_abi::{Attr, CreateIn, OpenOptions, ROOT_ID, SetattrValid, stat64};
+use fuse_backend_rs::api::filesystem::{
+    AsyncFileSystem, AsyncZeroCopyReader, AsyncZeroCopyWriter, Context, Entry, FileSystem,
+};
 use sea_orm::{ActiveModelTrait, Database, DatabaseConnection, EntityTrait, Set};
 use sea_orm_migration::MigratorTrait;
+use std::ffi::CStr;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use tracing::{debug, info};
 
 use crate::entities::{self, inode};
@@ -103,5 +110,126 @@ impl FileSystemManager {
     /// Get database connection (for external use)
     pub fn db(&self) -> &DatabaseConnection {
         &self.db
+    }
+}
+
+pub struct FloconFs;
+
+impl FileSystem for FloconFs {
+    type Inode = u64;
+    type Handle = u64;
+}
+
+#[async_trait]
+impl AsyncFileSystem for FloconFs {
+    async fn async_lookup(
+        &self,
+        ctx: &Context,
+        parent: Self::Inode,
+        name: &CStr,
+    ) -> std::io::Result<Entry> {
+        todo!()
+    }
+
+    async fn async_getattr(
+        &self,
+        ctx: &Context,
+        inode: Self::Inode,
+        handle: Option<Self::Handle>,
+    ) -> std::io::Result<(stat64, Duration)> {
+        todo!()
+    }
+
+    async fn async_setattr(
+        &self,
+        ctx: &Context,
+        inode: Self::Inode,
+        attr: stat64,
+        handle: Option<Self::Handle>,
+        valid: SetattrValid,
+    ) -> std::io::Result<(stat64, Duration)> {
+        todo!()
+    }
+
+    async fn async_open(
+        &self,
+        ctx: &Context,
+        inode: Self::Inode,
+        flags: u32,
+        fuse_flags: u32,
+    ) -> std::io::Result<(Option<Self::Handle>, OpenOptions)> {
+        todo!()
+    }
+
+    async fn async_create(
+        &self,
+        ctx: &Context,
+        parent: Self::Inode,
+        name: &CStr,
+        args: CreateIn,
+    ) -> std::io::Result<(Entry, Option<Self::Handle>, OpenOptions)> {
+        todo!()
+    }
+
+    async fn async_read(
+        &self,
+        ctx: &Context,
+        inode: Self::Inode,
+        handle: Self::Handle,
+        w: &mut (dyn AsyncZeroCopyWriter + Send),
+        size: u32,
+        offset: u64,
+        lock_owner: Option<u64>,
+        flags: u32,
+    ) -> std::io::Result<usize> {
+        todo!()
+    }
+
+    async fn async_write(
+        &self,
+        ctx: &Context,
+        inode: Self::Inode,
+        handle: Self::Handle,
+        r: &mut (dyn AsyncZeroCopyReader + Send),
+        size: u32,
+        offset: u64,
+        lock_owner: Option<u64>,
+        delayed_write: bool,
+        flags: u32,
+        fuse_flags: u32,
+    ) -> std::io::Result<usize> {
+        todo!()
+    }
+
+    async fn async_fsync(
+        &self,
+        ctx: &Context,
+        inode: Self::Inode,
+        datasync: bool,
+        handle: Self::Handle,
+    ) -> std::io::Result<()> {
+        todo!()
+    }
+
+    async fn async_fallocate(
+        &self,
+        ctx: &Context,
+        inode: Self::Inode,
+        handle: Self::Handle,
+        mode: u32,
+        offset: u64,
+        length: u64,
+    ) -> std::io::Result<()> {
+        todo!()
+    }
+
+    async fn async_fsyncdir(
+        &self,
+        ctx: &Context,
+        inode: Self::Inode,
+        datasync: bool,
+        handle: Self::Handle,
+    ) -> std::io::Result<()> {
+        todo!()
     }
 }

@@ -1,5 +1,8 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
+use fuse_backend_rs::api::server::Server;
+use fuse_backend_rs::transport::FuseSession;
+use std::sync::Arc;
 use std::{num::ParseIntError, path::PathBuf};
 use tracing::{Level, error, info};
 use tracing_subscriber;
@@ -7,7 +10,7 @@ use tracing_subscriber;
 mod entities;
 mod filesystem;
 
-use filesystem::FileSystemManager;
+use filesystem::{FileSystemManager, FloconFs};
 
 #[derive(Parser)]
 #[command(author, version, about, color = clap::ColorChoice::Auto)]
@@ -149,9 +152,78 @@ async fn flocon_mount(
     // Ensure filesystem is initialized (runs migrations if needed)
     fs_manager.ensure_initialized(mode, uid, gid).await?;
 
-    // TODO: Implement actual FUSE mounting logic here
-    // fs_manager.mount(&mount_point, daemonize).await?;
+    let fs = FloconFs {};
+    let fs_arc = Arc::new(fs);
+    let server = Server::new(fs_arc);
 
+    info!("Mounting filesystem at {:?}", mount_point);
+    let mut session = FuseSession::new(mount_point.as_path(), "flocon", "", false)?;
+    session.mount()?;
+
+    let mut channel = session.new_channel()?;
+
+    // Spawn the FUSE server thread
+    let mut fuse_handle = tokio::task::spawn_blocking(move || {
+        info!("Starting FUSE server");
+
+        loop {
+            match channel.get_request() {
+                Ok(Some((reader, writer))) => {
+                    if let Err(e) = server.handle_message(reader, writer.into(), None, None) {
+                        error!("Error handling FUSE request: {:?}", e);
+                    }
+                }
+
+                Ok(None) => {
+                    info!("Fuse channel closed, exiting server loop");
+                    break;
+                }
+
+                Err(e) => {
+                    error!("Error reading FUSE request: {:?}", e);
+                    break;
+                }
+            }
+        }
+    });
+
+    // Create a task that waits for CTRL+C
+    let mut ctrl_c_handle = tokio::spawn(async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("Failed to listen for ctrl+c");
+        info!("Received CTRL+C signal");
+    });
+
+    // Race between CTRL+C and FUSE thread completion
+    tokio::select! {
+        _ = &mut ctrl_c_handle => {
+            info!("Shutdown requested, unmounting filesystem...");
+            session.umount()?;
+
+            // Now wait for FUSE thread to finish
+            match fuse_handle.await {
+                Ok(_) => info!("FUSE server stopped successfully"),
+                Err(e) => error!("FUSE server join error: {:?}", e),
+            }
+        }
+
+        result = &mut fuse_handle => {
+            // FUSE thread finished on its own
+            match result {
+                Ok(_) => info!("FUSE server stopped"),
+                Err(e) => error!("FUSE server error: {:?}", e),
+            }
+
+            // Try to unmount (might already be unmounted)
+            let _ = session.umount();
+
+            // Cancel the ctrl+c handler
+            ctrl_c_handle.abort();
+        }
+    }
+
+    info!("Filesystem unmounted");
     Ok(())
 }
 
