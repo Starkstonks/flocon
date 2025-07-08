@@ -4,20 +4,12 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+anyhow = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive", "color"] }
-fuse-backend-rs = { version = "0.12", features = ["async-io", "fusedev", "virtiofs"] }
-sea-orm = { version = "1.1", features = [ "sqlx-sqlite", "runtime-tokio-rustls", "macros" ] }
-sea-orm-migration = { version = "1.1", features = ["runtime-tokio-native-tls", "sqlx-sqlite"] }
+ctrlc = { version = "3.4", features = ["termination"] }
+fuse-backend-rs = { version = "0.12", features = ["fusedev", "virtiofs"] }
+diesel = { version = "2.2", features = ["sqlite", "chrono", "returning_clauses_for_sqlite_3_35"] }
+diesel_migrations = { version = "2.2" }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tokio = { version = "1", features = ["full"] }
-anyhow = "1.0.98"
-chrono = "0.4.41"
-migration = { path = "migration" }
-async-trait = "0.1.88"
-
-[workspace]
-members = [
-    ".",
-    "migration",
-]

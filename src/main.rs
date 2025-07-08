@@ -3,12 +3,14 @@ use clap::{Parser, Subcommand, ValueEnum};
 use fuse_backend_rs::api::server::Server;
 use fuse_backend_rs::transport::FuseSession;
 use std::sync::Arc;
-use std::{num::ParseIntError, path::PathBuf};
+use std::sync::mpsc::channel;
+use std::{num::ParseIntError, path::PathBuf, thread};
 use tracing::{Level, error, info};
 use tracing_subscriber;
 
-mod entities;
 mod filesystem;
+mod models;
+mod schema;
 
 use filesystem::{FileSystemManager, FloconFs};
 
@@ -47,7 +49,7 @@ enum Commands {
     /// Mounts the specified DB into the specified location
     Mount {
         /// Image file path
-        #[arg(value_name = "IMAGE", value_parser = ensure_parent_exists)]
+        #[arg(value_name = "IMAGE", value_parser = parse_existing_file)]
         image: PathBuf,
 
         /// Mount point directory
@@ -104,10 +106,23 @@ fn parse_octal(s: &str) -> Result<u32, String> {
 
 fn ensure_parent_exists(s: &str) -> Result<PathBuf, String> {
     let p = PathBuf::from(s);
-    match p.parent() {
-        Some(parent) if parent.exists() => Ok(p),
-        _ => Err("parent directory of IMAGE does not exist".into()),
+    if let Some(parent) = p.parent() {
+        if parent.is_dir() || parent.as_os_str().is_empty() {
+            return Ok(p);
+        }
     }
+    Err("parent directory of IMAGE does not exist".into())
+}
+
+fn parse_existing_file(s: &str) -> Result<PathBuf, String> {
+    let path = PathBuf::from(s);
+    if !path.exists() {
+        return Err(format!("Path does not exist: {}", s));
+    }
+    if !path.is_file() {
+        return Err(format!("Path is not a file: {}", s));
+    }
+    Ok(path)
 }
 
 fn parse_existing_dir(s: &str) -> Result<PathBuf, String> {
@@ -123,18 +138,18 @@ fn parse_existing_dir(s: &str) -> Result<PathBuf, String> {
 
 /// Creates a file system image by creating a SQLite database initialized with
 /// the right schema.
-async fn flocon_mkfs(image: PathBuf, mode: u32, uid: u32, gid: u32) -> Result<()> {
+fn flocon_mkfs(image: PathBuf, mode: u32, uid: u32, gid: u32) -> Result<()> {
     info!("Creating new filesystem image: {:?}", image);
 
-    let mut fs_manager = FileSystemManager::new(&image).await?;
-    fs_manager.initialize_filesystem(mode, uid, gid).await?;
+    let mut fs_manager = FileSystemManager::new(&image)?;
+    fs_manager.initialize_filesystem(mode, uid, gid)?;
 
     info!("Successfully created filesystem image");
     Ok(())
 }
 
 /// Mounts a flocon filesystem using FUSE on the local system
-async fn flocon_mount(
+fn flocon_mount(
     image: PathBuf,
     mount_point: PathBuf,
     mode: u32,
@@ -147,10 +162,8 @@ async fn flocon_mount(
     info!("Mode: {:o}, UID: {}, GID: {}", mode, uid, gid);
     info!("Daemonize: {}", daemonize);
 
-    let mut fs_manager = FileSystemManager::open(&image).await?;
-
-    // Ensure filesystem is initialized (runs migrations if needed)
-    fs_manager.ensure_initialized(mode, uid, gid).await?;
+    let mut fs_manager = FileSystemManager::open(&image)?;
+    fs_manager.ensure_initialized(mode, uid, gid)?;
 
     let fs = FloconFs {};
     let fs_arc = Arc::new(fs);
@@ -160,12 +173,15 @@ async fn flocon_mount(
     let mut session = FuseSession::new(mount_point.as_path(), "flocon", "", false)?;
     session.mount()?;
 
+    let (tx, rx) = channel();
+    ctrlc::set_handler(move || {
+        tx.send(()).expect("Could not send signal on channel.");
+    })?;
+
     let mut channel = session.new_channel()?;
 
-    // Spawn the FUSE server thread
-    let mut fuse_handle = tokio::task::spawn_blocking(move || {
+    let fuse_handle = thread::spawn(move || {
         info!("Starting FUSE server");
-
         loop {
             match channel.get_request() {
                 Ok(Some((reader, writer))) => {
@@ -173,54 +189,28 @@ async fn flocon_mount(
                         error!("Error handling FUSE request: {:?}", e);
                     }
                 }
-
                 Ok(None) => {
-                    info!("Fuse channel closed, exiting server loop");
+                    info!("FUSE channel closed, exiting server loop");
                     break;
                 }
-
                 Err(e) => {
                     error!("Error reading FUSE request: {:?}", e);
                     break;
                 }
             }
         }
+        info!("FUSE server stopped");
     });
 
-    // Create a task that waits for CTRL+C
-    let mut ctrl_c_handle = tokio::spawn(async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("Failed to listen for ctrl+c");
-        info!("Received CTRL+C signal");
-    });
+    info!("Waiting for Ctrl-C to unmount...");
+    rx.recv()?;
 
-    // Race between CTRL+C and FUSE thread completion
-    tokio::select! {
-        _ = &mut ctrl_c_handle => {
-            info!("Shutdown requested, unmounting filesystem...");
-            session.umount()?;
+    info!("Shutdown requested, unmounting filesystem...");
+    session.umount()?;
 
-            // Now wait for FUSE thread to finish
-            match fuse_handle.await {
-                Ok(_) => info!("FUSE server stopped successfully"),
-                Err(e) => error!("FUSE server join error: {:?}", e),
-            }
-        }
-
-        result = &mut fuse_handle => {
-            // FUSE thread finished on its own
-            match result {
-                Ok(_) => info!("FUSE server stopped"),
-                Err(e) => error!("FUSE server error: {:?}", e),
-            }
-
-            // Try to unmount (might already be unmounted)
-            let _ = session.umount();
-
-            // Cancel the ctrl+c handler
-            ctrl_c_handle.abort();
-        }
+    match fuse_handle.join() {
+        Ok(_) => info!("FUSE server thread finished cleanly"),
+        Err(e) => error!("FUSE server thread panicked: {:?}", e),
     }
 
     info!("Filesystem unmounted");
@@ -230,41 +220,36 @@ async fn flocon_mount(
 fn main() {
     let cli = Cli::parse();
 
-    let rt = tokio::runtime::Runtime::new().unwrap();
+    let log_level = match &cli.command {
+        Commands::Mkfs { log_level, .. } => log_level.clone(),
+        Commands::Mount { log_level, .. } => log_level.clone(),
+    };
 
-    match cli.command {
+    let level: Level = log_level.into();
+    tracing_subscriber::fmt().with_max_level(level).init();
+
+    let result = match cli.command {
         Commands::Mkfs {
             image,
             mode,
             uid,
             gid,
-            log_level,
-        } => {
-            let level: Level = log_level.into();
-            tracing_subscriber::fmt().with_max_level(level).init();
+            ..
+        } => flocon_mkfs(image, mode, uid, gid),
 
-            if let Err(e) = rt.block_on(flocon_mkfs(image, mode, uid, gid)) {
-                error!("Failed to create filesystem: {}", e);
-                std::process::exit(1);
-            }
-        }
         Commands::Mount {
             image,
             mount_point,
             mode,
             uid,
             gid,
-            log_level,
             daemonize,
-        } => {
-            let level: Level = log_level.into();
-            tracing_subscriber::fmt().with_max_level(level).init();
+            ..
+        } => flocon_mount(image, mount_point, mode, uid, gid, daemonize),
+    };
 
-            if let Err(e) = rt.block_on(flocon_mount(image, mount_point, mode, uid, gid, daemonize))
-            {
-                error!("Failed to mount filesystem: {}", e);
-                std::process::exit(1);
-            }
-        }
+    if let Err(e) = result {
+        error!("Operation failed: {:#}", e);
+        std::process::exit(1);
     }
 }
