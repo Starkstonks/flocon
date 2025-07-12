@@ -127,6 +127,14 @@ pub trait WinterHandle {
         offset: off_t,
         r: &mut dyn ZeroCopyReader,
     ) -> io::Result<size_t>;
+
+    /// Like write but guaranteed to append at the end of the file
+    fn append(
+        &mut self,
+        context: &mut Self::Context,
+        size: size_t,
+        r: &mut dyn ZeroCopyReader,
+    ) -> io::Result<size_t>;
 }
 
 struct OwnedDirEntry {
@@ -885,7 +893,7 @@ where
         offset: u64,
         _lock_owner: Option<u64>,
         _delayed_write: bool,
-        _flags: u32,
+        flags: u32,
         _fuse_flags: u32,
     ) -> io::Result<usize> {
         self.with_context(|op_ctx| {
@@ -899,7 +907,11 @@ where
 
             let bytes_written = self
                 .with_handle_mut(handle_id, |fh| {
-                    fh.write(op_ctx, size as size_t, offset as off_t, r)
+                    if flags & libc::O_APPEND as u32 != 0 {
+                        fh.append(op_ctx, size as size_t, r)
+                    } else {
+                        fh.write(op_ctx, size as size_t, offset as off_t, r)
+                    }
                 })?
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid handle"))?;
 

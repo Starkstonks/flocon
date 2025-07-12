@@ -565,6 +565,75 @@ impl WinterHandle for FloconHandle {
 
         Ok(bytes_read)
     }
+
+    /// Mostly bypassing the block logic in order to have an efficient append
+    /// (we're probably writing logs or something like that, so it's more
+    /// important to atomically insert the lines we're given than doing block
+    /// computation).
+    fn append(
+        &mut self,
+        context: &mut Self::Context,
+        size: size_t,
+        r: &mut dyn ZeroCopyReader,
+    ) -> std::io::Result<size_t> {
+        use crate::schema::block;
+        use crate::schema::block::dsl::{block as block_table, inode_id, last_byte};
+        use crate::schema::inode::dsl::{inode, size as inode_size};
+
+        let current_inode_id = self.inode.get_id() as i32;
+
+        let mut incoming_data = vec![0u8; size];
+        let bytes_read = r.read(&mut incoming_data)?;
+        if bytes_read == 0 {
+            return Ok(0);
+        }
+
+        incoming_data.truncate(bytes_read);
+
+        let append_start = block_table
+            .filter(inode_id.eq(current_inode_id))
+            .select(diesel::dsl::max(last_byte))
+            .first::<Option<i32>>(&mut context.conn)
+            .map_err(|e| Error::new(ErrorKind::Other, e))?
+            .map(|max_byte| max_byte + 1)
+            .unwrap_or(0);
+
+        let mut working_blocks = Vec::new();
+        let mut current_offset = append_start;
+
+        for chunk in incoming_data.chunks(self.block_size as usize) {
+            let chunk_end = current_offset + chunk.len() as i32 - 1;
+            working_blocks.push(WorkingBlock::new(
+                None,
+                current_offset,
+                chunk_end,
+                Some(chunk.to_vec()),
+            ));
+            current_offset = chunk_end + 1;
+        }
+
+        let new_blocks: Vec<_> = working_blocks
+            .iter()
+            .map(|wb| wb.to_new_block(current_inode_id))
+            .collect();
+
+        if !new_blocks.is_empty() {
+            diesel::insert_into(block::table)
+                .values(&new_blocks)
+                .execute(&mut context.conn)
+                .map_err(|e| Error::new(ErrorKind::Other, e))?;
+        }
+
+        let new_size = append_start + bytes_read as i32;
+        let updated_inode = diesel::update(inode.find(current_inode_id))
+            .set(inode_size.eq(new_size))
+            .get_result::<ModelInode>(&mut context.conn)
+            .map_err(|e| Error::new(ErrorKind::Other, e))?;
+
+        self.inode.model = updated_inode;
+
+        Ok(bytes_read)
+    }
 }
 
 pub struct Flocon {
