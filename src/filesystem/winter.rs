@@ -1,7 +1,9 @@
 use chrono::{DateTime, TimeZone, Utc};
 use core::time::Duration;
 use fuse_backend_rs::abi::fuse_abi::{CreateIn, OpenOptions, SetattrValid};
-use fuse_backend_rs::api::filesystem::{Context, DirEntry, Entry, FileSystem, ZeroCopyWriter};
+use fuse_backend_rs::api::filesystem::{
+    Context, DirEntry, Entry, FileSystem, ZeroCopyReader, ZeroCopyWriter,
+};
 use libc::{
     O_EXCL, O_TRUNC, RENAME_EXCHANGE, RENAME_NOREPLACE, S_IFDIR, S_IFREG, blkcnt64_t, blksize_t,
     gid_t, ino64_t, mode_t, off_t, size_t, stat64, time_t, uid_t,
@@ -115,6 +117,15 @@ pub trait WinterHandle {
         size: size_t,
         offset: off_t,
         w: &mut dyn ZeroCopyWriter,
+    ) -> io::Result<size_t>;
+
+    /// Persists the provided data into storage
+    fn write(
+        &mut self,
+        context: &mut Self::Context,
+        size: size_t,
+        offset: off_t,
+        r: &mut dyn ZeroCopyReader,
     ) -> io::Result<size_t>;
 }
 
@@ -841,6 +852,42 @@ where
             }
 
             bytes_read
+        })
+    }
+
+    fn write(
+        &self,
+        _ctx: &Context,
+        inode: Self::Inode,
+        handle: Self::Handle,
+        r: &mut dyn ZeroCopyReader,
+        size: u32,
+        offset: u64,
+        _lock_owner: Option<u64>,
+        _delayed_write: bool,
+        _flags: u32,
+        _fuse_flags: u32,
+    ) -> io::Result<usize> {
+        self.with_context(|op_ctx| {
+            let (use_temp_handle, handle_id) = if handle != 0 {
+                (false, handle)
+            } else {
+                let fh = self.fs.open(op_ctx, inode, libc::O_WRONLY as u32)?;
+                let id = self.create_handle(fh);
+                (true, id)
+            };
+
+            let bytes_written = self
+                .with_handle_mut(handle_id, |fh| {
+                    fh.write(op_ctx, size as size_t, offset as off_t, r)
+                })?
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid handle"))?;
+
+            if use_temp_handle {
+                self.remove_handle(handle_id);
+            }
+
+            bytes_written
         })
     }
 

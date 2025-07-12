@@ -12,7 +12,7 @@ use diesel::dsl::sql;
 use diesel::prelude::*;
 use diesel::r2d2::{ConnectionManager, PooledConnection};
 use diesel::sql_types::Integer;
-use fuse_backend_rs::api::filesystem::ZeroCopyWriter;
+use fuse_backend_rs::api::filesystem::{ZeroCopyReader, ZeroCopyWriter};
 use libc::{S_IFDIR, blksize_t, gid_t, mode_t, off_t, size_t, uid_t};
 use std::io::{Error, ErrorKind};
 use std::time::Duration;
@@ -224,6 +224,7 @@ impl WinterInode for FloconInode {
 
 pub struct FloconHandle {
     inode: FloconInode,
+    block_size: blksize_t,
 }
 
 impl FloconHandle {
@@ -295,8 +296,106 @@ impl WinterHandle for FloconHandle {
         self.update_inode(context, inode_gid.eq(gid as i32))
     }
 
+    /// Grows or shrinks the file to fit the size that we're asked to have.
+    /// There are quite a few logic branches in there, but it should cover all
+    /// the cases.
     fn set_size(&mut self, context: &mut Self::Context, size: off_t) -> std::io::Result<()> {
-        todo!()
+        use crate::schema::block::dsl::{block, first_byte, inode_id, last_byte};
+        use crate::schema::inode::dsl::{inode, size as inode_size};
+
+        let current_inode_id = self.inode.get_id() as i32;
+        let current_size = self.inode.model.size as off_t;
+
+        if size == current_size {
+            return Ok(());
+        }
+
+        if size < current_size {
+            // Truncating - remove or trim blocks beyond the new size
+            let truncate_point = size as i32;
+
+            // Delete blocks that are entirely beyond the new size
+            diesel::delete(
+                block
+                    .filter(inode_id.eq(current_inode_id))
+                    .filter(first_byte.ge(truncate_point)),
+            )
+            .execute(&mut context.conn)
+            .map_err(|e| Error::new(ErrorKind::Other, e))?;
+
+            // Find blocks that span the truncation point
+            let spanning_blocks: Vec<ModelBlock> = block
+                .filter(inode_id.eq(current_inode_id))
+                .filter(first_byte.lt(truncate_point))
+                .filter(last_byte.ge(truncate_point))
+                .load::<ModelBlock>(&mut context.conn)
+                .map_err(|e| Error::new(ErrorKind::Other, e))?;
+
+            // Trim blocks that span the truncation point
+            for spanning_block in spanning_blocks {
+                let mut working_block = WorkingBlock::from_model(spanning_block);
+                if let Ok(trimmed) =
+                    working_block.clip(working_block.first_byte, truncate_point - 1)
+                {
+                    // Delete the old block
+                    diesel::delete(
+                        block.filter(crate::schema::block::id.eq(working_block.id.unwrap())),
+                    )
+                    .execute(&mut context.conn)
+                    .map_err(|e| Error::new(ErrorKind::Other, e))?;
+
+                    // Insert the trimmed block
+                    let new_block = trimmed.to_new_block(current_inode_id);
+                    diesel::insert_into(crate::schema::block::table)
+                        .values(&new_block)
+                        .execute(&mut context.conn)
+                        .map_err(|e| Error::new(ErrorKind::Other, e))?;
+                }
+            }
+        } else {
+            // Growing - create a zero-filled block if needed
+            if current_size > 0 {
+                // Find the last block to see if we need to fill a gap
+                let last_block: Option<ModelBlock> = block
+                    .filter(inode_id.eq(current_inode_id))
+                    .order(last_byte.desc())
+                    .first::<ModelBlock>(&mut context.conn)
+                    .optional()
+                    .map_err(|e| Error::new(ErrorKind::Other, e))?;
+
+                if let Some(last) = last_block {
+                    let gap_start = last.last_byte + 1;
+                    let gap_end = (size - 1) as i32;
+
+                    if gap_start <= gap_end {
+                        // Create a zero-filled block for the gap
+                        let gap_block = WorkingBlock::new(None, gap_start, gap_end, None);
+                        let new_block = gap_block.to_new_block(current_inode_id);
+                        diesel::insert_into(crate::schema::block::table)
+                            .values(&new_block)
+                            .execute(&mut context.conn)
+                            .map_err(|e| Error::new(ErrorKind::Other, e))?;
+                    }
+                } else if size > 0 {
+                    // No blocks exist, create one zero-filled block
+                    let new_block = WorkingBlock::new(None, 0, (size - 1) as i32, None);
+                    let block_to_insert = new_block.to_new_block(current_inode_id);
+                    diesel::insert_into(crate::schema::block::table)
+                        .values(&block_to_insert)
+                        .execute(&mut context.conn)
+                        .map_err(|e| Error::new(ErrorKind::Other, e))?;
+                }
+            }
+        }
+
+        // Update the inode size
+        let updated_inode = diesel::update(inode.find(current_inode_id))
+            .set(inode_size.eq(size as i32))
+            .get_result::<ModelInode>(&mut context.conn)
+            .map_err(|e| Error::new(ErrorKind::Other, e))?;
+
+        self.inode.model = updated_inode;
+        Ok(())
     }
 
     fn set_atime(
@@ -367,6 +466,104 @@ impl WinterHandle for FloconHandle {
 
         let sequence = Sequence::new(working_blocks).clip(read_start, read_end);
         sequence.concrete_data_to_writer(w)
+    }
+
+    /// We're writing the data following that logic:
+    ///
+    /// 1. The input data is chunked into blocks of the size that we like
+    /// 2. Then we fetch existing blocks that overlap with those would-be
+    ///    blocks
+    /// 3. Using a blocks Sequence, we insert the new blocks
+    /// 4. This allows us to know which blocks are left untouched (those who
+    ///    kept their ID), which ones are to be inserted (if they do not have
+    ///    an ID) and which ones need to be deleted (those not in the output
+    ///    anymore)
+    /// 5. Finally we wrap up and return the written size, without forgetting
+    ///    to update the pre-computed size on the inode as well
+    fn write(
+        &mut self,
+        context: &mut Self::Context,
+        size: size_t,
+        offset: off_t,
+        r: &mut dyn ZeroCopyReader,
+    ) -> std::io::Result<size_t> {
+        use crate::schema::block::dsl::{block, first_byte, inode_id, last_byte};
+        use crate::schema::inode::dsl::{inode, size as inode_size};
+
+        let current_inode_id = self.inode.get_id() as i32;
+        let write_start = offset as i32;
+        let write_end = (offset + size as off_t - 1) as i32;
+
+        let mut incoming_data = vec![0u8; size];
+        let bytes_read = r.read(&mut incoming_data)?;
+        if bytes_read != size {
+            return Err(Error::new(ErrorKind::Other, "Unexpected EOF"));
+        }
+
+        let model_blocks: Vec<ModelBlock> = block
+            .filter(inode_id.eq(current_inode_id))
+            .filter(last_byte.ge(write_start))
+            .filter(first_byte.le(write_end))
+            .order(first_byte.asc())
+            .load::<ModelBlock>(&mut context.conn)
+            .map_err(|e| Error::new(ErrorKind::Other, e))?;
+
+        let working_blocks: Vec<WorkingBlock> = model_blocks
+            .into_iter()
+            .map(WorkingBlock::from_model)
+            .collect();
+
+        let original_block_ids: std::collections::HashSet<i32> =
+            working_blocks.iter().filter_map(|b| b.id).collect();
+
+        let mut sequence = Sequence::new(working_blocks);
+
+        let mut current_offset = write_start;
+        for chunk in incoming_data.chunks(self.block_size as usize) {
+            let chunk_end = current_offset + chunk.len() as i32 - 1;
+            let new_block =
+                WorkingBlock::new(None, current_offset, chunk_end, Some(chunk.to_vec()));
+            sequence = sequence.replace(new_block);
+            current_offset = chunk_end + 1;
+        }
+
+        for blk in &sequence.blocks {
+            if let Some(_id) = blk.id {
+                // This block didn't change, so we don't do anything
+            } else {
+                let new_block = blk.to_new_block(current_inode_id);
+                diesel::insert_into(crate::schema::block::table)
+                    .values(&new_block)
+                    .execute(&mut context.conn)
+                    .map_err(|e| Error::new(ErrorKind::Other, e))?;
+            }
+        }
+
+        let remaining_block_ids: std::collections::HashSet<i32> =
+            sequence.blocks.iter().filter_map(|b| b.id).collect();
+
+        let deleted_ids: Vec<i32> = original_block_ids
+            .difference(&remaining_block_ids)
+            .cloned()
+            .collect();
+
+        if !deleted_ids.is_empty() {
+            use crate::schema::block::dsl::id;
+            diesel::delete(block.filter(id.eq_any(deleted_ids)))
+                .execute(&mut context.conn)
+                .map_err(|e| Error::new(ErrorKind::Other, e))?;
+        }
+
+        let new_size = (write_end + 1).max(self.inode.model.size);
+        if new_size != self.inode.model.size {
+            let updated_inode = diesel::update(inode.find(current_inode_id))
+                .set(inode_size.eq(new_size))
+                .get_result::<ModelInode>(&mut context.conn)
+                .map_err(|e| Error::new(ErrorKind::Other, e))?;
+            self.inode.model = updated_inode;
+        }
+
+        Ok(bytes_read)
     }
 }
 
@@ -439,6 +636,7 @@ impl WinterFs for Flocon {
 
         Ok(FloconHandle {
             inode: tree.get_inode(inode)?,
+            block_size: self.block_size()?,
         })
     }
 }
