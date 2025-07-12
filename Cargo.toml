@@ -9,7 +9,16 @@ chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive", "color"] }
 ctrlc = { version = "3.4", features = ["termination"] }
 fuse-backend-rs = { version = "0.12", features = ["fusedev", "virtiofs"] }
-diesel = { version = "2.2", features = ["sqlite", "chrono", "returning_clauses_for_sqlite_3_35"] }
 diesel_migrations = { version = "2.2" }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+libc = "0.2.174"
+
+[dependencies.diesel]
+version = "2.2"
+features = [
+    "sqlite",
+    "chrono",
+    "returning_clauses_for_sqlite_3_35",
+    "r2d2"
+]

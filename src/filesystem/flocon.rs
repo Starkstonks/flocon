@@ -1,0 +1,399 @@
+use crate::filesystem::sqlite::FileSystemManager;
+use crate::filesystem::winter::{WinterFs, WinterInode, WinterTree};
+use crate::filesystem::{EntryCore, WinterHandle};
+use crate::models::inode::DateTimeUtc;
+use crate::models::{Inode as ModelInode, NewInode, NewLink};
+use crate::schema::inode::dsl::{id as inode_id, inode as inode_table};
+use crate::schema::link::dsl::{child_id, link, name as link_name, parent_id};
+use chrono::{DateTime, Utc};
+use diesel::connection::SimpleConnection;
+use diesel::dsl::sql;
+use diesel::prelude::*;
+use diesel::r2d2::{ConnectionManager, PooledConnection};
+use diesel::sql_types::Integer;
+use libc::{S_IFDIR, blksize_t, gid_t, mode_t, off_t, size_t, uid_t};
+use std::io::{Error, ErrorKind};
+use std::time::Duration;
+
+/// Context passed to each FUSE operation
+pub struct FloconContext {
+    pub conn: PooledConnection<ConnectionManager<SqliteConnection>>,
+}
+
+/// A tree that borrows the context
+pub struct FloconTree<'ctx> {
+    ctx: &'ctx mut FloconContext,
+}
+
+impl<'ctx> WinterTree for FloconTree<'ctx> {
+    type Inode = FloconInode;
+
+    fn lookup(&mut self, parent: u64, name: &str) -> std::io::Result<u64> {
+        link.filter(parent_id.eq(parent as i32))
+            .filter(link_name.eq(name))
+            .select(child_id)
+            .first::<i32>(&mut self.ctx.conn)
+            .optional()
+            .map(|opt_id| opt_id.map_or(0, |id| id as u64))
+            .map_err(|e| Error::new(std::io::ErrorKind::Other, e))
+    }
+
+    fn get_inode(&mut self, inode: u64) -> std::io::Result<Self::Inode> {
+        inode_table
+            .find(inode as i32)
+            .first::<ModelInode>(&mut self.ctx.conn)
+            .map(|model| FloconInode { model })
+            .map_err(|e| {
+                let kind = match e {
+                    diesel::result::Error::NotFound => std::io::ErrorKind::NotFound,
+                    _ => std::io::ErrorKind::Other,
+                };
+                Error::new(kind, e)
+            })
+    }
+
+    fn empty_inode(&mut self) -> Self::Inode {
+        let epoch = DateTime::from_timestamp(0, 0).unwrap();
+
+        FloconInode {
+            model: ModelInode {
+                id: 0,
+                mode: 0,
+                uid: 0,
+                gid: 0,
+                size: 0,
+                atime: epoch.into(),
+                mtime: epoch.into(),
+                ctime: epoch.into(),
+                btime: epoch.into(),
+            },
+        }
+    }
+
+    /// Finding children of a given directory which also are directories. This
+    /// might sound weird, but that's what WinterFs needs in order to simulate
+    /// UNIX-style link-counting on directories
+    fn count_child_directories(&mut self, inode: u64) -> std::io::Result<u64> {
+        let num_dirs = link
+            .inner_join(inode_table.on(child_id.eq(inode_id)))
+            .filter(parent_id.eq(inode as i32))
+            .filter(sql::<Integer>(&format!("mode & {}", S_IFDIR)).ne(0))
+            .count()
+            .get_result::<i64>(&mut self.ctx.conn)
+            .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?;
+
+        Ok(num_dirs as u64)
+    }
+
+    /// Finds all the potential parents of a given inode, meaning that it's all
+    /// the directories in which you would find this inode
+    fn find_parents_of(&mut self, inode: u64) -> std::io::Result<Vec<u64>> {
+        link.filter(child_id.eq(inode as i32))
+            .select(parent_id)
+            .load::<i32>(&mut self.ctx.conn)
+            .map(|ids| ids.into_iter().map(|id| id as u64).collect())
+            .map_err(|e| Error::new(std::io::ErrorKind::Other, e))
+    }
+
+    fn create_inode(
+        &mut self,
+        mode: mode_t,
+        uid_t: uid_t,
+        gid_t: gid_t,
+    ) -> std::io::Result<Self::Inode> {
+        use crate::schema::inode;
+
+        let now = Utc::now();
+        let new_inode = NewInode {
+            mode: mode as i32,
+            uid: uid_t as i32,
+            gid: gid_t as i32,
+            size: 0,
+            atime: now.into(),
+            mtime: now.into(),
+            ctime: now.into(),
+            btime: now.into(),
+        };
+
+        let inserted_inode = diesel::insert_into(inode::table)
+            .values(&new_inode)
+            .get_result::<ModelInode>(&mut self.ctx.conn)
+            .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?;
+
+        Ok(FloconInode {
+            model: inserted_inode,
+        })
+    }
+
+    fn add_child(&mut self, parent: u64, child: u64, name: &str) -> std::io::Result<()> {
+        let new_link = NewLink {
+            parent_id: parent as i32,
+            child_id: child as i32,
+            name: name.to_string(),
+        };
+
+        diesel::insert_into(link)
+            .values(&new_link)
+            .execute(&mut self.ctx.conn)
+            .map(|_| ())
+            .map_err(|e| Error::new(std::io::ErrorKind::Other, e))
+    }
+
+    fn remove_child(&mut self, parent: u64, name: &str) -> std::io::Result<()> {
+        let target = link
+            .filter(parent_id.eq(parent as i32))
+            .filter(link_name.eq(name));
+
+        diesel::delete(target)
+            .execute(&mut self.ctx.conn)
+            .map(|_| ())
+            .map_err(|e| Error::new(std::io::ErrorKind::Other, e))
+    }
+
+    fn find_children_of(
+        &mut self,
+        parent: u64,
+        size: size_t,
+        offset: size_t,
+    ) -> std::io::Result<Vec<(String, u64)>> {
+        let results: Vec<(String, i32)> = link
+            .filter(parent_id.eq(parent as i32))
+            .select((link_name, child_id))
+            .order(link_name.asc())
+            .limit(size as i64)
+            .offset(offset as i64)
+            .load(&mut self.ctx.conn)
+            .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?;
+
+        Ok(results
+            .into_iter()
+            .map(|(name, id)| (name, id as u64))
+            .collect())
+    }
+}
+
+pub struct FloconInode {
+    model: ModelInode,
+}
+
+impl WinterInode for FloconInode {
+    fn get_id(&self) -> u64 {
+        self.model.id as u64
+    }
+
+    fn get_mode(&self) -> mode_t {
+        self.model.mode as mode_t
+    }
+
+    fn make_entry(&self) -> std::io::Result<EntryCore> {
+        let atime: DateTime<Utc> = self.model.atime.into();
+        let mtime: DateTime<Utc> = self.model.mtime.into();
+        let ctime: DateTime<Utc> = self.model.ctime.into();
+
+        Ok(EntryCore {
+            st_ino: self.model.id as u64,
+            st_size: self.model.size as off_t,
+            st_atime: atime.timestamp(),
+            st_atime_nsec: atime.timestamp_subsec_nanos().into(),
+            st_mtime: mtime.timestamp(),
+            st_mtime_nsec: mtime.timestamp_subsec_nanos().into(),
+            st_ctime: ctime.timestamp(),
+            st_ctime_nsec: ctime.timestamp_subsec_nanos().into(),
+            st_mode: self.model.mode as mode_t,
+            st_uid: self.model.uid as uid_t,
+            st_gid: self.model.gid as gid_t,
+        })
+    }
+
+    /// We're not a network file system so we leave the cache in place for
+    /// a significant amount of time (the kernel will expire the cache entries
+    /// when it modifies things from its own point of view)
+    fn attr_valid_time(&self) -> std::io::Result<Duration> {
+        Ok(Duration::from_secs(3600 * 24 * 365))
+    }
+
+    /// We're not a network file system so we leave the cache in place for
+    /// a significant amount of time (the kernel will expire the cache entries
+    /// when it modifies things from its own point of view)
+    fn entry_valid_time(&self) -> std::io::Result<Duration> {
+        Ok(Duration::from_secs(3600 * 24 * 365))
+    }
+}
+
+pub struct FloconHandle {
+    inode: FloconInode,
+}
+
+impl FloconHandle {
+    /// Shared method between all the set_xxx() methods which will update a
+    /// given attribute in storage and reload the associated model with the
+    /// latest available version.
+    fn update_inode<CS>(
+        &mut self,
+        context: &mut FloconContext,
+        changeset: CS,
+    ) -> std::io::Result<()>
+    where
+        CS: diesel::query_builder::AsChangeset<Target = crate::schema::inode::table>,
+        CS::Changeset: diesel::query_builder::QueryFragment<diesel::sqlite::Sqlite>,
+    {
+        use crate::schema::inode::dsl::inode as inode_table;
+
+        let updated = diesel::update(inode_table.find(self.inode.get_id() as i32))
+            .set(changeset)
+            .get_result::<ModelInode>(&mut context.conn)
+            .map_err(|e| Error::new(ErrorKind::Other, e))?;
+
+        self.inode.model = updated;
+        Ok(())
+    }
+}
+
+impl WinterHandle for FloconHandle {
+    type Context = FloconContext;
+    type Inode = FloconInode;
+
+    fn get_inode(&self) -> &Self::Inode {
+        &self.inode
+    }
+
+    fn flush(&mut self, _context: &mut Self::Context) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn truncate(&mut self, context: &mut Self::Context) -> std::io::Result<()> {
+        use crate::schema::block::dsl::{block, inode_id};
+        use crate::schema::inode::dsl::{inode, size as inode_size};
+
+        diesel::delete(block.filter(inode_id.eq(self.inode.get_id() as i32)))
+            .execute(&mut context.conn)
+            .map_err(|e| Error::new(ErrorKind::Other, e))?;
+
+        let updated_inode = diesel::update(inode.find(self.inode.get_id() as i32))
+            .set((inode_size.eq(0),))
+            .get_result::<ModelInode>(&mut context.conn)
+            .map_err(|e| Error::new(ErrorKind::Other, e))?;
+
+        self.inode.model = updated_inode;
+        Ok(())
+    }
+
+    fn set_mode(&mut self, context: &mut Self::Context, mode: mode_t) -> std::io::Result<()> {
+        use crate::schema::inode::dsl::mode as inode_mode;
+        self.update_inode(context, inode_mode.eq(mode as i32))
+    }
+
+    fn set_uid(&mut self, context: &mut Self::Context, uid: uid_t) -> std::io::Result<()> {
+        use crate::schema::inode::dsl::uid as inode_uid;
+        self.update_inode(context, inode_uid.eq(uid as i32))
+    }
+
+    fn set_gid(&mut self, context: &mut Self::Context, gid: gid_t) -> std::io::Result<()> {
+        use crate::schema::inode::dsl::gid as inode_gid;
+        self.update_inode(context, inode_gid.eq(gid as i32))
+    }
+
+    fn set_size(&mut self, context: &mut Self::Context, size: off_t) -> std::io::Result<()> {
+        todo!()
+    }
+
+    fn set_atime(
+        &mut self,
+        context: &mut Self::Context,
+        atime: DateTime<Utc>,
+    ) -> std::io::Result<()> {
+        use crate::schema::inode::dsl::atime as inode_atime;
+        self.update_inode(context, inode_atime.eq::<DateTimeUtc>(atime.into()))
+    }
+
+    fn set_mtime(
+        &mut self,
+        context: &mut Self::Context,
+        mtime: DateTime<Utc>,
+    ) -> std::io::Result<()> {
+        use crate::schema::inode::dsl::mtime as inode_mtime;
+        self.update_inode(context, inode_mtime.eq::<DateTimeUtc>(mtime.into()))
+    }
+
+    fn set_ctime(
+        &mut self,
+        context: &mut Self::Context,
+        ctime: DateTime<Utc>,
+    ) -> std::io::Result<()> {
+        use crate::schema::inode::dsl::ctime as inode_ctime;
+        self.update_inode(context, inode_ctime.eq::<DateTimeUtc>(ctime.into()))
+    }
+}
+
+pub struct Flocon {
+    fs_manager: FileSystemManager,
+}
+
+impl Flocon {
+    pub fn new(fs_manager: FileSystemManager) -> Self {
+        Flocon { fs_manager }
+    }
+}
+
+impl WinterFs for Flocon {
+    type Context = FloconContext;
+    type Handle = FloconHandle;
+    type Inode = FloconInode;
+
+    type Tree<'ctx>
+        = FloconTree<'ctx>
+    where
+        Self: 'ctx;
+
+    /// For now let's hard-code this. According to my statistics, most files
+    /// are less than 1 Mio (and then it jumps through the roof) so we'll use
+    /// this as a block size to limit having to deal with multi-block stuff for
+    /// most files.
+    fn block_size(&self) -> Result<blksize_t, std::io::Error> {
+        Ok(1024 * 1024)
+    }
+
+    fn create_context(&self) -> Result<Self::Context, Error> {
+        let mut conn = self
+            .fs_manager
+            .get_connection()
+            .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?;
+        conn.batch_execute("begin")
+            .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?;
+        Ok(FloconContext { conn })
+    }
+
+    fn sync_context(&self, ctx: &mut Self::Context) -> Result<(), Error> {
+        ctx.conn
+            .batch_execute("commit")
+            .map_err(|e| Error::new(std::io::ErrorKind::Other, e))
+    }
+
+    fn rollback_context(&self, ctx: &mut Self::Context) -> Result<(), Error> {
+        ctx.conn
+            .batch_execute("rollback")
+            .map_err(|e| Error::new(std::io::ErrorKind::Other, e))
+    }
+
+    fn close_context(&self, ctx: &mut Self::Context) -> Result<(), Error> {
+        let _ = self.rollback_context(ctx);
+        Ok(())
+    }
+
+    fn tree<'ctx>(&self, context: &'ctx mut Self::Context) -> Result<Self::Tree<'ctx>, Error> {
+        Ok(FloconTree { ctx: context })
+    }
+
+    fn open(
+        &self,
+        ctx: &mut Self::Context,
+        inode: u64,
+        _flags: u32,
+    ) -> Result<Self::Handle, Error> {
+        let mut tree = self.tree(ctx)?;
+
+        Ok(FloconHandle {
+            inode: tree.get_inode(inode)?,
+        })
+    }
+}

@@ -12,7 +12,7 @@ mod filesystem;
 mod models;
 mod schema;
 
-use filesystem::{FileSystemManager, FloconFs};
+use crate::filesystem::{FileSystemManager, Flocon, WinterFsHandler};
 
 #[derive(Parser)]
 #[command(author, version, about, color = clap::ColorChoice::Auto)]
@@ -141,8 +141,7 @@ fn parse_existing_dir(s: &str) -> Result<PathBuf, String> {
 fn flocon_mkfs(image: PathBuf, mode: u32, uid: u32, gid: u32) -> Result<()> {
     info!("Creating new filesystem image: {:?}", image);
 
-    let mut fs_manager = FileSystemManager::new(&image)?;
-    fs_manager.initialize_filesystem(mode, uid, gid)?;
+    FileSystemManager::new(&image, mode, uid, gid)?;
 
     info!("Successfully created filesystem image");
     Ok(())
@@ -162,10 +161,8 @@ fn flocon_mount(
     info!("Mode: {:o}, UID: {}, GID: {}", mode, uid, gid);
     info!("Daemonize: {}", daemonize);
 
-    let mut fs_manager = FileSystemManager::open(&image)?;
-    fs_manager.ensure_initialized(mode, uid, gid)?;
-
-    let fs = FloconFs {};
+    let fs_manager = FileSystemManager::new(&image, mode, uid, gid)?;
+    let fs = WinterFsHandler::new(Flocon::new(fs_manager));
     let fs_arc = Arc::new(fs);
     let server = Server::new(fs_arc);
 
