@@ -1,3 +1,4 @@
+mod blocks;
 mod flocon;
 mod sqlite;
 mod winter;

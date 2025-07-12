@@ -1,8 +1,9 @@
+use crate::filesystem::blocks::{Sequence, WorkingBlock};
 use crate::filesystem::sqlite::FileSystemManager;
 use crate::filesystem::winter::{WinterFs, WinterInode, WinterTree};
 use crate::filesystem::{EntryCore, WinterHandle};
 use crate::models::inode::DateTimeUtc;
-use crate::models::{Inode as ModelInode, NewInode, NewLink};
+use crate::models::{Block as ModelBlock, Inode as ModelInode, NewInode, NewLink};
 use crate::schema::inode::dsl::{id as inode_id, inode as inode_table};
 use crate::schema::link::dsl::{child_id, link, name as link_name, parent_id};
 use chrono::{DateTime, Utc};
@@ -11,6 +12,7 @@ use diesel::dsl::sql;
 use diesel::prelude::*;
 use diesel::r2d2::{ConnectionManager, PooledConnection};
 use diesel::sql_types::Integer;
+use fuse_backend_rs::api::filesystem::ZeroCopyWriter;
 use libc::{S_IFDIR, blksize_t, gid_t, mode_t, off_t, size_t, uid_t};
 use std::io::{Error, ErrorKind};
 use std::time::Duration;
@@ -322,6 +324,49 @@ impl WinterHandle for FloconHandle {
     ) -> std::io::Result<()> {
         use crate::schema::inode::dsl::ctime as inode_ctime;
         self.update_inode(context, inode_ctime.eq::<DateTimeUtc>(ctime.into()))
+    }
+
+    /// We're going through all the blocks "touched" by the read operation and
+    /// then throwing them as efficiently as possible into the provided writer
+    /// given to us by FUSE.
+    fn read(
+        &mut self,
+        context: &mut Self::Context,
+        size: size_t,
+        offset: off_t,
+        w: &mut dyn ZeroCopyWriter,
+    ) -> std::io::Result<size_t> {
+        use crate::schema::block::dsl::{block, first_byte, inode_id, last_byte};
+
+        let current_inode_id = self.inode.get_id() as i32;
+        let file_size = self.inode.model.size as off_t;
+
+        if offset >= file_size {
+            return Ok(0);
+        }
+
+        let read_start = offset as i32;
+        let read_end = (offset + size as off_t - 1).min(file_size - 1) as i32;
+
+        if read_start > read_end {
+            return Ok(0);
+        }
+
+        let model_blocks: Vec<ModelBlock> = block
+            .filter(inode_id.eq(current_inode_id))
+            .filter(last_byte.ge(read_start))
+            .filter(first_byte.le(read_end))
+            .order(first_byte.asc())
+            .load::<ModelBlock>(&mut context.conn)
+            .map_err(|e| Error::new(ErrorKind::Other, e))?;
+
+        let working_blocks: Vec<WorkingBlock> = model_blocks
+            .into_iter()
+            .map(WorkingBlock::from_model)
+            .collect();
+
+        let sequence = Sequence::new(working_blocks).clip(read_start, read_end);
+        sequence.concrete_data_to_writer(w)
     }
 }
 

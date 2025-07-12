@@ -1,10 +1,10 @@
 use chrono::{DateTime, TimeZone, Utc};
 use core::time::Duration;
-use fuse_backend_rs::abi::fuse_abi::{OpenOptions, SetattrValid};
-use fuse_backend_rs::api::filesystem::{Context, DirEntry, Entry, FileSystem};
+use fuse_backend_rs::abi::fuse_abi::{CreateIn, OpenOptions, SetattrValid};
+use fuse_backend_rs::api::filesystem::{Context, DirEntry, Entry, FileSystem, ZeroCopyWriter};
 use libc::{
-    RENAME_EXCHANGE, RENAME_NOREPLACE, S_IFDIR, blkcnt64_t, blksize_t, gid_t, ino64_t, mode_t,
-    off_t, size_t, stat64, time_t, uid_t,
+    O_EXCL, O_TRUNC, RENAME_EXCHANGE, RENAME_NOREPLACE, S_IFDIR, S_IFREG, blkcnt64_t, blksize_t,
+    gid_t, ino64_t, mode_t, off_t, size_t, stat64, time_t, uid_t,
 };
 use std::collections::HashMap;
 use std::ffi::CStr;
@@ -107,6 +107,15 @@ pub trait WinterHandle {
     fn set_mtime(&mut self, context: &mut Self::Context, atime: DateTime<Utc>) -> io::Result<()>;
 
     fn set_ctime(&mut self, context: &mut Self::Context, atime: DateTime<Utc>) -> io::Result<()>;
+
+    /// Reads a slice of the data into the provided writer
+    fn read(
+        &mut self,
+        context: &mut Self::Context,
+        size: size_t,
+        offset: off_t,
+        w: &mut dyn ZeroCopyWriter,
+    ) -> io::Result<size_t>;
 }
 
 struct OwnedDirEntry {
@@ -740,13 +749,98 @@ where
         self.with_context(|op_ctx| {
             let mut fh = self.fs.open(op_ctx, inode, flags)?;
 
-            if flags & libc::O_TRUNC as u32 != 0 {
+            if flags & O_TRUNC as u32 != 0 {
                 fh.truncate(op_ctx)?;
             }
 
             let id = self.create_handle(fh);
 
             Ok((Some(id), OpenOptions::empty(), None))
+        })
+    }
+
+    fn create(
+        &self,
+        ctx: &Context,
+        parent: Self::Inode,
+        name: &CStr,
+        args: CreateIn,
+    ) -> io::Result<(Entry, Option<Self::Handle>, OpenOptions, Option<u32>)> {
+        self.with_context(|op_ctx| {
+            let name_str = name
+                .to_str()
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Invalid UTF-8"))?;
+
+            let (file_id, entry) = {
+                let mut tree = self.fs.tree(op_ctx)?;
+                let existing_id = tree.lookup(parent, name_str)?;
+
+                if existing_id != 0 && args.flags & O_EXCL as u32 != 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "File already exists",
+                    ));
+                }
+
+                let file_id = if existing_id == 0 {
+                    let full_mode = S_IFREG | (args.mode & !args.umask);
+                    let file = tree.create_inode(full_mode, ctx.uid, ctx.gid)?;
+                    let new_id = file.get_id();
+                    tree.add_child(parent, new_id, name_str)?;
+                    new_id
+                } else {
+                    existing_id
+                };
+
+                let inode = tree.get_inode(file_id)?;
+                let entry = self.make_entry(&inode, &mut tree)?;
+
+                (file_id, entry)
+            };
+
+            let mut fh = self.fs.open(op_ctx, file_id, args.flags)?;
+
+            if args.flags & O_TRUNC as u32 != 0 {
+                fh.truncate(op_ctx)?;
+            }
+
+            let id = self.create_handle(fh);
+
+            Ok((entry, Some(id), OpenOptions::empty(), None))
+        })
+    }
+
+    fn read(
+        &self,
+        _ctx: &Context,
+        inode: Self::Inode,
+        handle: Self::Handle,
+        w: &mut dyn ZeroCopyWriter,
+        size: u32,
+        offset: u64,
+        _lock_owner: Option<u64>,
+        _flags: u32,
+    ) -> io::Result<usize> {
+        self.with_context(|op_ctx| {
+            let (use_temp_handle, handle_id) = if handle != 0 {
+                (false, handle)
+            } else {
+                let fh = self.fs.open(op_ctx, inode, libc::O_RDONLY as u32)?;
+                let id = self.create_handle(fh);
+                (true, id)
+            };
+
+            let bytes_read = self
+                .with_handle_mut(handle_id, |fh| {
+                    fh.read(op_ctx, size as size_t, offset as off_t, w)
+                })?
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid handle"))?;
+
+            if use_temp_handle {
+                self.remove_handle(handle_id);
+            }
+
+            bytes_read
         })
     }
 
