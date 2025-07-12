@@ -1,6 +1,6 @@
 use chrono::{DateTime, TimeZone, Utc};
 use core::time::Duration;
-use fuse_backend_rs::abi::fuse_abi::{CreateIn, OpenOptions, SetattrValid};
+use fuse_backend_rs::abi::fuse_abi::{CreateIn, FsOptions, OpenOptions, SetattrValid};
 use fuse_backend_rs::api::filesystem::{
     Context, DirEntry, Entry, FileSystem, ZeroCopyReader, ZeroCopyWriter,
 };
@@ -512,6 +512,26 @@ where
 {
     type Inode = u64;
     type Handle = u64;
+
+    fn init(&self, capable: FsOptions) -> io::Result<FsOptions> {
+        let mut wanted = FsOptions::empty();
+
+        #[cfg(target_os = "linux")]
+        {
+            wanted.insert(FsOptions::MAX_PAGES);
+            wanted.insert(FsOptions::BIG_WRITES);
+            wanted.insert(FsOptions::WRITEBACK_CACHE);
+        }
+
+        wanted.insert(FsOptions::AUTO_INVAL_DATA);
+        wanted.insert(FsOptions::ATOMIC_O_TRUNC);
+        wanted.insert(FsOptions::DO_READDIRPLUS);
+        wanted.insert(FsOptions::READDIRPLUS_AUTO);
+        wanted.insert(FsOptions::CACHE_SYMLINKS);
+        wanted.insert(FsOptions::POSIX_ACL);
+
+        Ok(capable & wanted)
+    }
 
     fn lookup(&self, _ctx: &Context, parent: Self::Inode, name: &CStr) -> io::Result<Entry> {
         self.with_context(|op_ctx| {
