@@ -263,6 +263,56 @@ impl<FS: WinterFs> WinterFsHandler<FS> {
         }
     }
 
+    /// Helper that provides a context and handle, creating a temporary handle
+    /// if needed
+    fn with_context_and_handle<R>(
+        &self,
+        inode: u64,
+        handle: Option<u64>,
+        flags: u32,
+        f: impl FnOnce(&mut FS::Context, &mut FS::Handle) -> io::Result<R>,
+    ) -> io::Result<R> {
+        self.with_context(|ctx| {
+            let (use_temp_handle, handle_id) = if let Some(h) = handle.filter(|&h| h != 0) {
+                (false, h)
+            } else {
+                let fh = self.fs.open(ctx, inode, flags)?;
+                let id = self.create_handle(fh);
+                (true, id)
+            };
+
+            let result = self
+                .with_handle_mut(handle_id, |fh| f(ctx, fh))?
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid handle"))?;
+
+            if use_temp_handle {
+                self.remove_handle(handle_id);
+            }
+
+            result
+        })
+    }
+
+    /// Helper that provides a context and handle for read operations
+    fn with_context_and_handle_read<R>(
+        &self,
+        inode: u64,
+        handle: u64,
+        f: impl FnOnce(&mut FS::Context, &mut FS::Handle) -> io::Result<R>,
+    ) -> io::Result<R> {
+        self.with_context_and_handle(inode, Some(handle), libc::O_RDONLY as u32, f)
+    }
+
+    /// Helper that provides a context and handle for write operations
+    fn with_context_and_handle_write<R>(
+        &self,
+        inode: u64,
+        handle: u64,
+        f: impl FnOnce(&mut FS::Context, &mut FS::Handle) -> io::Result<R>,
+    ) -> io::Result<R> {
+        self.with_context_and_handle(inode, Some(handle), libc::O_WRONLY as u32, f)
+    }
+
     /// Allocate a new handle ID and insert the handle into the map
     fn create_handle(&self, handle: FS::Handle) -> u64 {
         let mut next = self.next_handle.lock().unwrap();
@@ -332,7 +382,6 @@ impl<FS: WinterFs> WinterFsHandler<FS> {
         st.st_mode = core.st_mode;
         st.st_uid = core.st_uid;
         st.st_gid = core.st_gid;
-        st.st_rdev = 0;
         st.st_size = core.st_size;
         st.st_blksize = bs;
         st.st_blocks = ((core.st_size + bs - 1) / bs) as blkcnt64_t;
@@ -435,9 +484,12 @@ impl<FS: WinterFs> WinterFsHandler<FS> {
         self.with_context(|op_ctx| {
             let mut tree = self.fs.tree(op_ctx)?;
 
-            let dir_id = self
-                .with_handle(handle, |fh| fh.get_inode().get_id())?
-                .unwrap_or_else(|| inode);
+            let dir_id = if handle != 0 {
+                self.with_handle(handle, |fh| fh.get_inode().get_id())?
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid handle"))?
+            } else {
+                inode
+            };
 
             let dir_inode = tree.get_inode(dir_id)?;
 
@@ -572,9 +624,9 @@ where
         self.with_context(|op_ctx| {
             let mut tree = self.fs.tree(op_ctx)?;
 
-            let inode_id = if let Some(handle_id) = handle {
+            let inode_id = if let Some(handle_id) = handle.filter(|&h| h != 0) {
                 self.with_handle(handle_id, |fh| fh.get_inode().get_id())?
-                    .unwrap_or_else(|| inode)
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid handle"))?
             } else {
                 inode
             };
@@ -593,82 +645,70 @@ where
         handle: Option<Self::Handle>,
         valid: SetattrValid,
     ) -> io::Result<(stat64, Duration)> {
-        self.with_context(|op_ctx| {
-            // Try to use existing handle or open a new one
-            let (use_temp_handle, handle_id) = if let Some(h) = handle {
-                (false, h)
-            } else {
-                // Open a temporary handle for this operation
-                let fh = self.fs.open(op_ctx, inode, 0)?;
-                let id = self.create_handle(fh);
-                (true, id)
-            };
+        self.with_context_and_handle(inode, handle, 0, |op_ctx, fh| {
+            if valid.contains(SetattrValid::MODE) {
+                fh.set_mode(op_ctx, attr.st_mode)?;
+            }
 
-            // Apply the attributes
-            let _ = self
-                .with_handle_mut(handle_id, |fh| {
-                    if valid.contains(SetattrValid::MODE) {
-                        fh.set_mode(op_ctx, attr.st_mode)?;
-                    }
+            if valid.contains(SetattrValid::UID) {
+                fh.set_uid(op_ctx, attr.st_uid)?;
+            }
 
-                    if valid.contains(SetattrValid::UID) {
-                        fh.set_uid(op_ctx, attr.st_uid)?;
-                    }
+            if valid.contains(SetattrValid::GID) {
+                fh.set_gid(op_ctx, attr.st_gid)?;
+            }
 
-                    if valid.contains(SetattrValid::GID) {
-                        fh.set_gid(op_ctx, attr.st_gid)?;
-                    }
+            if valid.contains(SetattrValid::SIZE) {
+                fh.set_size(op_ctx, attr.st_size)?;
+            }
 
-                    if valid.contains(SetattrValid::SIZE) {
-                        fh.set_size(op_ctx, attr.st_size)?;
-                    }
+            if valid.contains(SetattrValid::ATIME) {
+                let atime = Utc
+                    .timestamp_opt(attr.st_atime, attr.st_atime_nsec as u32)
+                    .single()
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("Invalid atime: {} {}", attr.st_atime, attr.st_atime_nsec),
+                        )
+                    })?;
+                fh.set_atime(op_ctx, atime)?;
+            } else if valid.contains(SetattrValid::ATIME_NOW) {
+                fh.set_atime(op_ctx, Utc::now())?;
+            }
 
-                    if valid.contains(SetattrValid::ATIME) {
-                        let atime = Utc
-                            .timestamp_opt(attr.st_atime, attr.st_atime_nsec as u32)
-                            .single()
-                            .expect("Invalid atime");
-                        fh.set_atime(op_ctx, atime)?;
-                    } else if valid.contains(SetattrValid::ATIME_NOW) {
-                        fh.set_atime(op_ctx, Utc::now())?;
-                    }
+            if valid.contains(SetattrValid::MTIME) {
+                let mtime = Utc
+                    .timestamp_opt(attr.st_mtime, attr.st_mtime_nsec as u32)
+                    .single()
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("Invalid mtime: {} {}", attr.st_mtime, attr.st_mtime_nsec),
+                        )
+                    })?;
+                fh.set_mtime(op_ctx, mtime)?;
+            } else if valid.contains(SetattrValid::MTIME_NOW) {
+                fh.set_mtime(op_ctx, Utc::now())?;
+            }
 
-                    if valid.contains(SetattrValid::MTIME) {
-                        let mtime = Utc
-                            .timestamp_opt(attr.st_mtime, attr.st_mtime_nsec as u32)
-                            .single()
-                            .expect("Invalid mtime");
-                        fh.set_mtime(op_ctx, mtime)?;
-                    } else if valid.contains(SetattrValid::MTIME_NOW) {
-                        fh.set_mtime(op_ctx, Utc::now())?;
-                    }
-
-                    if valid.contains(SetattrValid::CTIME) {
-                        let ctime = Utc
-                            .timestamp_opt(attr.st_ctime, attr.st_ctime_nsec as u32)
-                            .single()
-                            .expect("Invalid ctime");
-                        fh.set_ctime(op_ctx, ctime)?;
-                    }
-
-                    Ok::<(), io::Error>(())
-                })?
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid handle"))?;
+            if valid.contains(SetattrValid::CTIME) {
+                let ctime = Utc
+                    .timestamp_opt(attr.st_ctime, attr.st_ctime_nsec as u32)
+                    .single()
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("Invalid ctime: {} {}", attr.st_ctime, attr.st_ctime_nsec),
+                        )
+                    })?;
+                fh.set_ctime(op_ctx, ctime)?;
+            }
 
             // Get the result
             let mut tree = self.fs.tree(op_ctx)?;
-            let result_inode_id = self
-                .with_handle(handle_id, |fh| fh.get_inode().get_id())?
-                .unwrap_or_else(|| inode);
-
-            let result_inode = tree.get_inode(result_inode_id)?;
+            let result_inode = tree.get_inode(fh.get_inode().get_id())?;
             let entry = self.make_entry(&result_inode, &mut tree)?;
-
-            // Clean up temporary handle if we created one
-            if use_temp_handle {
-                self.remove_handle(handle_id);
-            }
-
             Ok((entry.attr, entry.attr_timeout))
         })
     }
@@ -784,23 +824,56 @@ where
         })
     }
 
-    fn open(
+    fn link(
         &self,
         _ctx: &Context,
         inode: Self::Inode,
-        flags: u32,
-        _fuse_flags: u32,
-    ) -> io::Result<(Option<Self::Handle>, OpenOptions, Option<u32>)> {
+        newparent: Self::Inode,
+        newname: &CStr,
+    ) -> io::Result<Entry> {
         self.with_context(|op_ctx| {
-            let mut fh = self.fs.open(op_ctx, inode, flags)?;
+            let name_str = newname
+                .to_str()
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Invalid UTF-8"))?;
 
-            if flags & O_TRUNC as u32 != 0 {
-                fh.truncate(op_ctx)?;
+            let mut tree = self.fs.tree(op_ctx)?;
+
+            // Get the parent directory
+            let parent = tree.get_inode(newparent)?;
+
+            // Verify parent is a directory
+            if parent.get_mode() & S_IFDIR == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotADirectory,
+                    "Parent is not a directory",
+                ));
             }
 
-            let id = self.create_handle(fh);
+            // Get the file to link
+            let file = tree.get_inode(inode)?;
 
-            Ok((Some(id), OpenOptions::empty(), None))
+            // Verify the file is not a directory (hard links to directories are not allowed)
+            if file.get_mode() & S_IFDIR != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::IsADirectory,
+                    "Cannot create hard link to directory",
+                ));
+            }
+
+            // Check if the name already exists in the parent directory
+            let existing_id = tree.lookup(newparent, name_str)?;
+            if existing_id != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "File already exists",
+                ));
+            }
+
+            // Add the link
+            tree.add_child(newparent, inode, name_str)?;
+
+            // Return the entry for the linked file
+            self.make_entry(&file, &mut tree)
         })
     }
 
@@ -866,26 +939,8 @@ where
         _lock_owner: Option<u64>,
         _flags: u32,
     ) -> io::Result<usize> {
-        self.with_context(|op_ctx| {
-            let (use_temp_handle, handle_id) = if handle != 0 {
-                (false, handle)
-            } else {
-                let fh = self.fs.open(op_ctx, inode, libc::O_RDONLY as u32)?;
-                let id = self.create_handle(fh);
-                (true, id)
-            };
-
-            let bytes_read = self
-                .with_handle_mut(handle_id, |fh| {
-                    fh.read(op_ctx, size as size_t, offset as off_t, w)
-                })?
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid handle"))?;
-
-            if use_temp_handle {
-                self.remove_handle(handle_id);
-            }
-
-            bytes_read
+        self.with_context_and_handle_read(inode, handle, |op_ctx, fh| {
+            fh.read(op_ctx, size as size_t, offset as off_t, w)
         })
     }
 
@@ -902,30 +957,12 @@ where
         flags: u32,
         _fuse_flags: u32,
     ) -> io::Result<usize> {
-        self.with_context(|op_ctx| {
-            let (use_temp_handle, handle_id) = if handle != 0 {
-                (false, handle)
+        self.with_context_and_handle_write(inode, handle, |op_ctx, fh| {
+            if flags & libc::O_APPEND as u32 != 0 {
+                fh.append(op_ctx, size as size_t, r)
             } else {
-                let fh = self.fs.open(op_ctx, inode, libc::O_WRONLY as u32)?;
-                let id = self.create_handle(fh);
-                (true, id)
-            };
-
-            let bytes_written = self
-                .with_handle_mut(handle_id, |fh| {
-                    if flags & libc::O_APPEND as u32 != 0 {
-                        fh.append(op_ctx, size as size_t, r)
-                    } else {
-                        fh.write(op_ctx, size as size_t, offset as off_t, r)
-                    }
-                })?
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid handle"))?;
-
-            if use_temp_handle {
-                self.remove_handle(handle_id);
+                fh.write(op_ctx, size as size_t, offset as off_t, r)
             }
-
-            bytes_written
         })
     }
 
@@ -942,7 +979,9 @@ where
 
         self.with_context(|op_ctx| {
             self.with_handle_mut(handle, |fh| fh.flush(op_ctx))?
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid handle"))?
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "Invalid handle (flush)")
+                })?
         })
     }
 
@@ -965,7 +1004,7 @@ where
                 fh.fsync_metadata(op_ctx)?;
                 Ok(())
             })?
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid handle"))?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid handle (fsync)"))?
         })
     }
 
