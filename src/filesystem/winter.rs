@@ -1008,6 +1008,43 @@ where
         })
     }
 
+    /// Our fallocate implementation does not really respect the standard
+    /// because we have no intent of managing the actual layout of the disk
+    /// and this is entirely a call to manage the layout of the dis. Best we
+    /// can do is pretend the file is bigger (even though it isn't). We could
+    /// probably zero-fill to "reserve" the space but that'd be long and stupid
+    /// and I don't see any need to do this for the use-case.
+    fn fallocate(
+        &self,
+        _ctx: &Context,
+        inode: Self::Inode,
+        handle: Self::Handle,
+        mode: u32,
+        offset: u64,
+        length: u64,
+    ) -> io::Result<()> {
+        if mode != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Unsupported fallocate mode",
+            ));
+        }
+
+        let new_size = offset + length;
+
+        self.with_context_and_handle(inode, Some(handle), 0, |op_ctx, fh| {
+            // Get current size
+            let current_size = fh.get_inode().make_entry()?.st_size as u64;
+
+            // If the new size is larger than current size, extend the file
+            if new_size > current_size {
+                fh.set_size(op_ctx, new_size as off_t)?;
+            }
+
+            Ok(())
+        })
+    }
+
     fn readdir(
         &self,
         ctx: &Context,
