@@ -1159,7 +1159,7 @@ where
                         // This is expected, we can proceed
                     }
                     Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                        return Err(io::Error::new(io::ErrorKind::NotFound, "No data available"));
+                        return Err(io::Error::from_raw_os_error(libc::ENODATA));
                     }
                     Err(e) => return Err(e),
                 }
@@ -1181,7 +1181,10 @@ where
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Invalid UTF-8"))?;
 
         if name_str.is_empty() {
-            return Err(io::Error::new(io::ErrorKind::NotFound, "No data available"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Name cannot be empty",
+            ));
         }
 
         self.with_context_and_handle(inode, None, libc::O_RDONLY as u32, |ctx, fh| {
@@ -1190,16 +1193,13 @@ where
                     if size == 0 {
                         Ok(GetxattrReply::Count(value.len() as u32))
                     } else if (size as usize) < value.len() {
-                        Err(io::Error::new(
-                            io::ErrorKind::OutOfMemory,
-                            "Buffer too small",
-                        ))
+                        Err(io::Error::from_raw_os_error(libc::ERANGE))
                     } else {
                         Ok(GetxattrReply::Value(value))
                     }
                 }
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                    Err(io::Error::new(io::ErrorKind::NotFound, "No data available"))
+                    Err(io::Error::from_raw_os_error(libc::ENODATA))
                 }
                 Err(e) => Err(e),
             }
@@ -1219,10 +1219,7 @@ where
             if size == 0 {
                 Ok(ListxattrReply::Count(total_size as u32))
             } else if (size as usize) < total_size {
-                Err(io::Error::new(
-                    io::ErrorKind::OutOfMemory,
-                    "Buffer too small",
-                ))
+                Err(io::Error::from_raw_os_error(libc::ENODATA))
             } else {
                 let mut buffer = Vec::with_capacity(total_size);
                 for name in names {
