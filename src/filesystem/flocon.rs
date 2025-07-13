@@ -780,19 +780,14 @@ impl WinterHandle for FloconHandle {
 
 pub struct Flocon {
     fs_manager: FileSystemManager,
-    image_name: String,
+    image_path: std::path::PathBuf,
 }
 
 impl Flocon {
     pub fn new(fs_manager: FileSystemManager, image_path: &Path) -> Self {
-        let image_name = image_path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "unknown".to_string());
-
         Flocon {
             fs_manager,
-            image_name,
+            image_path: image_path.to_path_buf(),
         }
     }
 }
@@ -811,17 +806,56 @@ impl WinterFs for Flocon {
     /// are less than 1 Mio (and then it jumps through the roof) so we'll use
     /// this as a block size to limit having to deal with multi-block stuff for
     /// most files.
-    fn block_size(&self) -> Result<blksize_t, std::io::Error> {
+    fn block_size(&self) -> Result<blksize_t, Error> {
         Ok(1024 * 1024)
+    }
+
+    /// Used storage will be the DB file size
+    fn estimate_used_storage(&self) -> Result<u64, Error> {
+        let metadata = std::fs::metadata(&self.image_path)?;
+        Ok(metadata.len())
+    }
+
+    /// Free storage is how much storage we got left on the supporting media,
+    /// which is affected by many other factors but gives you a decent idea
+    /// of how much storage you can still use before things blow up I guess
+    fn estimate_free_storage(&self) -> Result<u64, Error> {
+        let parent = self
+            .image_path
+            .parent()
+            .ok_or_else(|| Error::new(ErrorKind::Other, "Image has no parent directory"))?;
+
+        let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+        let path_cstr = std::ffi::CString::new(parent.to_string_lossy().as_bytes())?;
+
+        let result = unsafe { libc::statvfs(path_cstr.as_ptr(), &mut stat) };
+        if result != 0 {
+            return Err(Error::last_os_error());
+        }
+
+        Ok(stat.f_bavail * stat.f_frsize)
+    }
+
+    /// For now we'll live-count the number of inodes. That's not the most
+    /// efficient way to go, so this will have to be optimized in the future.
+    fn estimate_files_count(&self, context: &mut Self::Context) -> Result<u64, Error> {
+        use crate::schema::inode::dsl::inode;
+
+        let count = inode
+            .count()
+            .get_result::<i64>(&mut context.conn)
+            .map_err(|e| Error::new(ErrorKind::Other, e))?;
+
+        Ok(count as u64)
     }
 
     fn create_context(&self) -> Result<Self::Context, Error> {
         let mut conn = self
             .fs_manager
             .get_connection()
-            .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?;
+            .map_err(|e| Error::new(ErrorKind::Other, e))?;
         conn.batch_execute("begin")
-            .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?;
+            .map_err(|e| Error::new(ErrorKind::Other, e))?;
         Ok(FloconContext { conn })
     }
 
@@ -854,10 +888,16 @@ impl WinterFs for Flocon {
     ) -> Result<Self::Handle, Error> {
         let mut tree = self.tree(ctx)?;
 
+        let image_name = self
+            .image_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "unknown".to_string());
+
         Ok(FloconHandle {
             inode: tree.get_inode(inode)?,
             block_size: self.block_size()?,
-            image_name: self.image_name.clone(),
+            image_name,
         })
     }
 }

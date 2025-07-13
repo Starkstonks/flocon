@@ -7,13 +7,13 @@ use fuse_backend_rs::api::filesystem::{
 };
 use libc::{
     O_EXCL, O_TRUNC, RENAME_EXCHANGE, RENAME_NOREPLACE, S_IFDIR, S_IFREG, blkcnt64_t, blksize_t,
-    gid_t, ino64_t, mode_t, off_t, size_t, stat64, time_t, uid_t,
+    c_ulong, gid_t, ino64_t, mode_t, off_t, size_t, stat64, statvfs64, time_t, uid_t,
 };
 use std::collections::HashMap;
 use std::ffi::CStr;
-use std::io;
 use std::mem::zeroed;
 use std::sync::Mutex;
+use std::{io, mem};
 
 pub trait WinterTree {
     type Inode: WinterInode;
@@ -198,6 +198,36 @@ pub trait WinterFs {
     /// in blocks instead of bytes, so this is kind of the baseline for giving
     /// editorial info to the callers).
     fn block_size(&self) -> Result<blksize_t, io::Error>;
+
+    /// Returns in bytes an estimation of how much storage is currently being
+    /// used on the physical media
+    fn estimate_used_storage(&self) -> Result<u64, io::Error>;
+
+    /// Here the goal is to estimate how much free storage there is on the
+    /// underlying storage medium so that at least you can have an idea of
+    /// how much more data you can add
+    fn estimate_free_storage(&self) -> Result<u64, io::Error>;
+
+    /// Counts how many files there are on the disk
+    fn estimate_files_count(&self, context: &mut Self::Context) -> Result<u64, io::Error>;
+
+    /// Indicates how many files you could have on the disk
+    ///
+    /// To be noted that we're taking the max integer and not the max unsigned
+    /// integer because apparently some implementations will overflow. But this
+    /// is no issue in the sense that it's not _really_ the max given that to
+    /// achieve this file count by creating one file every millisecond you'd
+    /// still need 292,277,024 years.
+    fn max_files_count(&self, _context: &mut Self::Context) -> Result<u64, io::Error> {
+        Ok(i64::MAX as u64)
+    }
+
+    /// If you have a limit in the max length of a file name give it here, we
+    /// give what seems to be a decent default, given that anyways software
+    /// up the chain probably has this limit hard-coded anyways.
+    fn get_name_max_size(&self, _context: &mut Self::Context) -> Result<u64, io::Error> {
+        Ok(4096)
+    }
 
     /// Creates a new context for an operation or a set of operations
     fn create_context(&self) -> Result<Self::Context, io::Error>;
@@ -1056,6 +1086,28 @@ where
             }
 
             Ok(())
+        })
+    }
+
+    fn statfs(&self, _ctx: &Context, _inode: Self::Inode) -> io::Result<statvfs64> {
+        self.with_context(|op_ctx| {
+            let mut stat: statvfs64 = unsafe { mem::zeroed() };
+
+            let block_size = self.fs.block_size()?;
+            let used_storage = self.fs.estimate_used_storage()?;
+            let free_storage = self.fs.estimate_free_storage()?;
+
+            stat.f_bsize = block_size as c_ulong;
+            stat.f_frsize = block_size as c_ulong;
+            stat.f_blocks =
+                (used_storage + free_storage + block_size as u64 - 1) / block_size as u64;
+            stat.f_bfree = free_storage / block_size as u64;
+            stat.f_bavail = stat.f_bfree;
+            stat.f_files = self.fs.estimate_files_count(op_ctx)?;
+            stat.f_ffree = self.fs.max_files_count(op_ctx)? - stat.f_files;
+            stat.f_namemax = self.fs.get_name_max_size(op_ctx)?;
+
+            Ok(stat)
         })
     }
 
