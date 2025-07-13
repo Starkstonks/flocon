@@ -2,7 +2,7 @@ use chrono::{DateTime, TimeZone, Utc};
 use core::time::Duration;
 use fuse_backend_rs::abi::fuse_abi::{CreateIn, FsOptions, OpenOptions, SetattrValid};
 use fuse_backend_rs::api::filesystem::{
-    Context, DirEntry, Entry, FileSystem, GetxattrReply, ListxattrReply, ZeroCopyReader,
+    Context, DirEntry, Entry, FileSystem, GetxattrReply, IoctlData, ListxattrReply, ZeroCopyReader,
     ZeroCopyWriter,
 };
 use libc::{
@@ -1502,5 +1502,20 @@ where
         self.remove_handle(handle);
 
         Ok(())
+    }
+
+    /// We might implement special features through ioctl but for now we just
+    /// will tell the upper layer to stick it
+    fn ioctl(
+        &self,
+        _ctx: &Context,
+        _inode: Self::Inode,
+        _handle: Self::Handle,
+        _flags: u32,
+        _cmd: u32,
+        _data: IoctlData,
+        _out_size: u32,
+    ) -> io::Result<IoctlData> {
+        Err(io::Error::from_raw_os_error(libc::ENOTTY))
     }
 }
