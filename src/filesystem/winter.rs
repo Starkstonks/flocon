@@ -1406,6 +1406,34 @@ where
         })
     }
 
+    fn opendir(
+        &self,
+        _ctx: &Context,
+        inode: Self::Inode,
+        flags: u32,
+    ) -> io::Result<(Option<Self::Handle>, OpenOptions)> {
+        self.with_context(|op_ctx| {
+            {
+                let mut tree = self.fs.tree(op_ctx)?;
+
+                // Verify the inode exists and is a directory
+                let dir_inode = tree.get_inode(inode)?;
+                if dir_inode.get_mode() & S_IFDIR == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotADirectory,
+                        "Not a directory",
+                    ));
+                }
+            }
+
+            // Open a handle for the directory
+            let fh = self.fs.open(op_ctx, inode, flags)?;
+            let handle_id = self.create_handle(fh);
+
+            Ok((Some(handle_id), OpenOptions::empty()))
+        })
+    }
+
     fn readdir(
         &self,
         ctx: &Context,
