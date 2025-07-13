@@ -2,7 +2,8 @@ use chrono::{DateTime, TimeZone, Utc};
 use core::time::Duration;
 use fuse_backend_rs::abi::fuse_abi::{CreateIn, FsOptions, OpenOptions, SetattrValid};
 use fuse_backend_rs::api::filesystem::{
-    Context, DirEntry, Entry, FileSystem, ZeroCopyReader, ZeroCopyWriter,
+    Context, DirEntry, Entry, FileSystem, GetxattrReply, ListxattrReply, ZeroCopyReader,
+    ZeroCopyWriter,
 };
 use libc::{
     O_EXCL, O_TRUNC, RENAME_EXCHANGE, RENAME_NOREPLACE, S_IFDIR, S_IFREG, blkcnt64_t, blksize_t,
@@ -141,6 +142,19 @@ pub trait WinterHandle {
         size: size_t,
         r: &mut dyn ZeroCopyReader,
     ) -> io::Result<size_t>;
+
+    /// Set an extended attribute on the inode
+    fn xattr_set(&mut self, context: &mut Self::Context, key: &str, value: &[u8])
+    -> io::Result<()>;
+
+    /// Get an extended attribute from the inode (fails if key doesn't exist)
+    fn xattr_get(&mut self, context: &mut Self::Context, key: &str) -> io::Result<Vec<u8>>;
+
+    /// Remove an extended attribute from the inode
+    fn xattr_remove(&mut self, context: &mut Self::Context, key: &str) -> io::Result<()>;
+
+    /// List all extended attribute keys for the inode
+    fn xattr_list(&mut self, context: &mut Self::Context) -> io::Result<Vec<String>>;
 }
 
 struct OwnedDirEntry {
@@ -1042,6 +1056,146 @@ where
             }
 
             Ok(())
+        })
+    }
+
+    fn setxattr(
+        &self,
+        _ctx: &Context,
+        inode: Self::Inode,
+        name: &CStr,
+        value: &[u8],
+        flags: u32,
+    ) -> io::Result<()> {
+        const XATTR_CREATE: u32 = 1;
+        const XATTR_REPLACE: u32 = 2;
+
+        let name_str = name
+            .to_str()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Invalid UTF-8"))?;
+
+        if name_str.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Empty xattr name",
+            ));
+        }
+
+        if flags != 0 && flags != XATTR_CREATE && flags != XATTR_REPLACE {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "Invalid flags"));
+        }
+
+        self.with_context_and_handle(inode, None, libc::O_WRONLY as u32, |ctx, fh| {
+            if flags == XATTR_CREATE {
+                match fh.xattr_get(ctx, name_str) {
+                    Ok(_) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::AlreadyExists,
+                            "Attribute already exists",
+                        ));
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                        // This is expected, we can proceed
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+
+            if flags == XATTR_REPLACE {
+                match fh.xattr_get(ctx, name_str) {
+                    Ok(_) => {
+                        // This is expected, we can proceed
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                        return Err(io::Error::new(io::ErrorKind::NotFound, "No data available"));
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+
+            fh.xattr_set(ctx, name_str, value)
+        })
+    }
+
+    fn getxattr(
+        &self,
+        _ctx: &Context,
+        inode: Self::Inode,
+        name: &CStr,
+        size: u32,
+    ) -> io::Result<GetxattrReply> {
+        let name_str = name
+            .to_str()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Invalid UTF-8"))?;
+
+        if name_str.is_empty() {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "No data available"));
+        }
+
+        self.with_context_and_handle(inode, None, libc::O_RDONLY as u32, |ctx, fh| {
+            match fh.xattr_get(ctx, name_str) {
+                Ok(value) => {
+                    if size == 0 {
+                        Ok(GetxattrReply::Count(value.len() as u32))
+                    } else if (size as usize) < value.len() {
+                        Err(io::Error::new(
+                            io::ErrorKind::OutOfMemory,
+                            "Buffer too small",
+                        ))
+                    } else {
+                        Ok(GetxattrReply::Value(value))
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    Err(io::Error::new(io::ErrorKind::NotFound, "No data available"))
+                }
+                Err(e) => Err(e),
+            }
+        })
+    }
+
+    fn listxattr(
+        &self,
+        _ctx: &Context,
+        inode: Self::Inode,
+        size: u32,
+    ) -> io::Result<ListxattrReply> {
+        self.with_context_and_handle(inode, None, libc::O_RDONLY as u32, |ctx, fh| {
+            let names = fh.xattr_list(ctx)?;
+            let total_size: usize = names.iter().map(|name| name.len() + 1).sum();
+
+            if size == 0 {
+                Ok(ListxattrReply::Count(total_size as u32))
+            } else if (size as usize) < total_size {
+                Err(io::Error::new(
+                    io::ErrorKind::OutOfMemory,
+                    "Buffer too small",
+                ))
+            } else {
+                let mut buffer = Vec::with_capacity(total_size);
+                for name in names {
+                    buffer.extend_from_slice(name.as_bytes());
+                    buffer.push(0);
+                }
+                Ok(ListxattrReply::Names(buffer))
+            }
+        })
+    }
+
+    fn removexattr(&self, _ctx: &Context, inode: Self::Inode, name: &CStr) -> io::Result<()> {
+        let name_str = name
+            .to_str()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Invalid UTF-8"))?;
+
+        if name_str.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Empty xattr name",
+            ));
+        }
+
+        self.with_context_and_handle(inode, None, libc::O_WRONLY as u32, |ctx, fh| {
+            fh.xattr_remove(ctx, name_str)
         })
     }
 

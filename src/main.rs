@@ -162,7 +162,7 @@ fn flocon_mount(
     info!("Daemonize: {}", daemonize);
 
     let fs_manager = FileSystemManager::new(&image, mode, uid, gid)?;
-    let fs = WinterFsHandler::new(Flocon::new(fs_manager));
+    let fs = WinterFsHandler::new(Flocon::new(fs_manager, &image));
     let fs_arc = Arc::new(fs);
     let server = Server::new(fs_arc);
 

@@ -15,6 +15,7 @@ use diesel::sql_types::Integer;
 use fuse_backend_rs::api::filesystem::{ZeroCopyReader, ZeroCopyWriter};
 use libc::{S_IFDIR, blksize_t, gid_t, mode_t, off_t, size_t, uid_t};
 use std::io::{Error, ErrorKind};
+use std::path::Path;
 use std::time::Duration;
 
 /// Context passed to each FUSE operation
@@ -225,6 +226,7 @@ impl WinterInode for FloconInode {
 pub struct FloconHandle {
     inode: FloconInode,
     block_size: blksize_t,
+    image_name: String,
 }
 
 impl FloconHandle {
@@ -660,15 +662,138 @@ impl WinterHandle for FloconHandle {
 
         Ok(bytes_read)
     }
+
+    fn xattr_set(
+        &mut self,
+        context: &mut Self::Context,
+        key: &str,
+        value: &[u8],
+    ) -> std::io::Result<()> {
+        use crate::models::NewXattr;
+        use crate::schema::xattr;
+
+        // Check if it's trying to set a flocon.* attribute
+        if key.starts_with("flocon.") {
+            return Err(Error::new(
+                ErrorKind::PermissionDenied,
+                "Cannot set flocon.* attributes",
+            ));
+        }
+
+        let current_inode_id = self.inode.get_id() as i32;
+
+        // Try to update existing xattr
+        let updated = diesel::update(
+            xattr::table
+                .filter(xattr::inode_id.eq(current_inode_id))
+                .filter(xattr::name.eq(key)),
+        )
+        .set(xattr::value.eq(value))
+        .execute(&mut context.conn)
+        .map_err(|e| Error::new(ErrorKind::Other, e))?;
+
+        // If no rows were updated, insert new xattr
+        if updated == 0 {
+            let new_xattr = NewXattr {
+                inode_id: current_inode_id,
+                name: key,
+                value,
+            };
+
+            diesel::insert_into(xattr::table)
+                .values(&new_xattr)
+                .execute(&mut context.conn)
+                .map_err(|e| Error::new(ErrorKind::Other, e))?;
+        }
+
+        Ok(())
+    }
+
+    fn xattr_get(&mut self, context: &mut Self::Context, key: &str) -> std::io::Result<Vec<u8>> {
+        use crate::schema::xattr;
+
+        let current_inode_id = self.inode.get_id() as i32;
+        let namespace = key.split('.').next().unwrap_or("");
+
+        match namespace {
+            "flocon" => match key {
+                "flocon.image" => Ok(self.image_name.as_bytes().to_vec()),
+                _ => Err(Error::new(ErrorKind::NotFound, "No data available")),
+            },
+            _ => xattr::table
+                .filter(xattr::inode_id.eq(current_inode_id))
+                .filter(xattr::name.eq(key))
+                .select(xattr::value)
+                .first::<Vec<u8>>(&mut context.conn)
+                .map_err(|e| match e {
+                    diesel::result::Error::NotFound => {
+                        Error::new(ErrorKind::NotFound, "No data available")
+                    }
+                    _ => Error::new(ErrorKind::Other, e),
+                }),
+        }
+    }
+
+    fn xattr_remove(&mut self, context: &mut Self::Context, key: &str) -> std::io::Result<()> {
+        use crate::schema::xattr;
+
+        if key.starts_with("flocon.") {
+            return Err(Error::new(
+                ErrorKind::PermissionDenied,
+                "Cannot remove flocon.* attributes",
+            ));
+        }
+
+        let current_inode_id = self.inode.get_id() as i32;
+
+        let deleted = diesel::delete(
+            xattr::table
+                .filter(xattr::inode_id.eq(current_inode_id))
+                .filter(xattr::name.eq(key)),
+        )
+        .execute(&mut context.conn)
+        .map_err(|e| Error::new(ErrorKind::Other, e))?;
+
+        if deleted == 0 {
+            return Err(Error::new(ErrorKind::NotFound, "No data available"));
+        }
+
+        Ok(())
+    }
+
+    fn xattr_list(&mut self, context: &mut Self::Context) -> std::io::Result<Vec<String>> {
+        use crate::schema::xattr;
+
+        let current_inode_id = self.inode.get_id() as i32;
+
+        let mut names: Vec<String> = xattr::table
+            .filter(xattr::inode_id.eq(current_inode_id))
+            .select(xattr::name)
+            .load::<String>(&mut context.conn)
+            .map_err(|e| Error::new(ErrorKind::Other, e))?;
+
+        names.push("flocon.image".to_string());
+
+        Ok(names)
+    }
 }
 
 pub struct Flocon {
     fs_manager: FileSystemManager,
+    image_name: String,
 }
 
 impl Flocon {
-    pub fn new(fs_manager: FileSystemManager) -> Self {
-        Flocon { fs_manager }
+    pub fn new(fs_manager: FileSystemManager, image_path: &Path) -> Self {
+        let image_name = image_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "unknown".to_string());
+
+        Flocon {
+            fs_manager,
+            image_name,
+        }
     }
 }
 
@@ -732,6 +857,7 @@ impl WinterFs for Flocon {
         Ok(FloconHandle {
             inode: tree.get_inode(inode)?,
             block_size: self.block_size()?,
+            image_name: self.image_name.clone(),
         })
     }
 }
