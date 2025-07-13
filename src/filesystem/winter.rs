@@ -93,6 +93,12 @@ pub trait WinterHandle {
     /// That would actually be fsync.
     fn flush(&mut self, context: &mut Self::Context) -> io::Result<()>;
 
+    /// Persists to the disk the data of the file (so blocks basically)
+    fn fsync_data(&mut self, context: &mut Self::Context) -> io::Result<()>;
+
+    /// Persists to the disk the metadata (so the inode itself essentially)
+    fn fsync_metadata(&mut self, context: &mut Self::Context) -> io::Result<()>;
+
     /// Empties the file completely
     fn truncate(&mut self, context: &mut Self::Context) -> io::Result<()>;
 
@@ -940,6 +946,29 @@ where
         })
     }
 
+    fn fsync(
+        &self,
+        _ctx: &Context,
+        _inode: Self::Inode,
+        datasync: bool,
+        handle: Self::Handle,
+    ) -> io::Result<()> {
+        if handle == 0 {
+            return Ok(());
+        }
+
+        self.with_context(|op_ctx| {
+            self.with_handle_mut(handle, |fh| {
+                if datasync {
+                    fh.fsync_data(op_ctx)?;
+                }
+                fh.fsync_metadata(op_ctx)?;
+                Ok(())
+            })?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid handle"))?
+        })
+    }
+
     fn readdir(
         &self,
         ctx: &Context,
@@ -978,5 +1007,15 @@ where
         }
 
         Ok(())
+    }
+
+    fn fsyncdir(
+        &self,
+        ctx: &Context,
+        inode: Self::Inode,
+        datasync: bool,
+        handle: Self::Handle,
+    ) -> io::Result<()> {
+        self.fsync(ctx, inode, datasync, handle)
     }
 }

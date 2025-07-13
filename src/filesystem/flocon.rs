@@ -264,6 +264,32 @@ impl WinterHandle for FloconHandle {
         Ok(())
     }
 
+    /// We force all data to be written onto the disk (for all files at the
+    /// same time but at least we're sure). Not sure if it's a good idea to be
+    /// so aggressive but let's try like that for now.
+    fn fsync_data(&mut self, context: &mut Self::Context) -> std::io::Result<()> {
+        context
+            .conn
+            .batch_execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            .map_err(|e| {
+                Error::new(ErrorKind::Other, format!("Failed to checkpoint WAL: {}", e))
+            })?;
+
+        Ok(())
+    }
+
+    /// Same as fsync_data but slightly less aggressive
+    fn fsync_metadata(&mut self, context: &mut Self::Context) -> std::io::Result<()> {
+        context
+            .conn
+            .batch_execute("PRAGMA wal_checkpoint(PASSIVE)")
+            .map_err(|e| {
+                Error::new(ErrorKind::Other, format!("Failed to checkpoint WAL: {}", e))
+            })?;
+
+        Ok(())
+    }
+
     fn truncate(&mut self, context: &mut Self::Context) -> std::io::Result<()> {
         use crate::schema::block::dsl::{block, inode_id};
         use crate::schema::inode::dsl::{inode, size as inode_size};

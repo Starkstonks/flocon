@@ -2,16 +2,58 @@ use anyhow::{Result, anyhow};
 use chrono::Utc;
 use diesel::Connection as _;
 use diesel::prelude::*;
-use diesel::r2d2::{ConnectionManager, Pool, PooledConnection};
+use diesel::r2d2::{ConnectionManager, CustomizeConnection, Pool, PooledConnection};
 use diesel::sqlite::SqliteConnection;
 use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
 use std::path::{Path, PathBuf};
 use tracing::{debug, info};
 
-use crate::models::{Inode, NewInode};
+use crate::models::NewInode;
 use crate::schema::inode;
 
 pub const MIGRATIONS: EmbeddedMigrations = embed_migrations!();
+
+/// Custom connection customizer that sets pragmas on each new connection
+#[derive(Debug)]
+struct SqliteConnectionCustomizer;
+
+impl CustomizeConnection<SqliteConnection, diesel::r2d2::Error> for SqliteConnectionCustomizer {
+    /// Our goal here is to configure properly the database features for our
+    /// needs, especially in terms of guarantees and performance. Everything
+    /// is static so far, maybe some values ought to be fine-tuned in the
+    /// future.
+    fn on_acquire(&self, conn: &mut SqliteConnection) -> Result<(), diesel::r2d2::Error> {
+        diesel::sql_query("PRAGMA journal_mode = WAL")
+            .execute(conn)
+            .map_err(|e| diesel::r2d2::Error::QueryError(e))?;
+
+        diesel::sql_query("PRAGMA foreign_keys = ON")
+            .execute(conn)
+            .map_err(|e| diesel::r2d2::Error::QueryError(e))?;
+
+        diesel::sql_query("PRAGMA auto_vacuum = INCREMENTAL")
+            .execute(conn)
+            .map_err(|e| diesel::r2d2::Error::QueryError(e))?;
+
+        diesel::sql_query("PRAGMA synchronous = NORMAL")
+            .execute(conn)
+            .map_err(|e| diesel::r2d2::Error::QueryError(e))?;
+
+        diesel::sql_query("PRAGMA temp_store = MEMORY")
+            .execute(conn)
+            .map_err(|e| diesel::r2d2::Error::QueryError(e))?;
+
+        diesel::sql_query("PRAGMA mmap_size = 30000000000") // 30GB mmap
+            .execute(conn)
+            .map_err(|e| diesel::r2d2::Error::QueryError(e))?;
+
+        diesel::sql_query("PRAGMA page_size = 4096")
+            .execute(conn)
+            .map_err(|e| diesel::r2d2::Error::QueryError(e))?;
+
+        Ok(())
+    }
+}
 
 pub struct FileSystemManager {
     pool: Pool<ConnectionManager<SqliteConnection>>,
@@ -27,7 +69,9 @@ impl FileSystemManager {
             .to_str()
             .ok_or_else(|| anyhow!("Invalid image path (not UTF-8)"))?;
         let manager = ConnectionManager::<SqliteConnection>::new(db_url);
+
         Pool::builder()
+            .connection_customizer(Box::new(SqliteConnectionCustomizer))
             .build(manager)
             .map_err(|e| anyhow!("Failed to create DB pool: {}", e))
     }
@@ -98,11 +142,13 @@ impl FileSystemManager {
     /// Idempotent initialization: migrations + root inode in a transaction.
     fn init(&self, mode: u32, uid: u32, gid: u32) -> Result<()> {
         let mut conn = self.get_connection()?;
+
         conn.transaction::<_, anyhow::Error, _>(|conn| {
             self.run_migrations(conn)?;
             self.ensure_root_inode(conn, mode, uid, gid)?;
             Ok(())
         })?;
+
         Ok(())
     }
 
