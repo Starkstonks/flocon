@@ -6,11 +6,12 @@ use fuse_backend_rs::api::filesystem::{
     ZeroCopyWriter,
 };
 use libc::{
-    O_EXCL, O_TRUNC, RENAME_EXCHANGE, RENAME_NOREPLACE, S_IFDIR, S_IFREG, blkcnt64_t, blksize_t,
-    c_ulong, gid_t, ino64_t, mode_t, off_t, size_t, stat64, statvfs64, time_t, uid_t,
+    O_EXCL, O_TRUNC, RENAME_EXCHANGE, RENAME_NOREPLACE, S_IFDIR, S_IFLNK, S_IFREG, blkcnt64_t,
+    blksize_t, c_ulong, gid_t, ino64_t, mode_t, off_t, size_t, stat64, statvfs64, time_t, uid_t,
 };
 use std::collections::HashMap;
 use std::ffi::CStr;
+use std::io::{Read, Write};
 use std::mem::zeroed;
 use std::sync::Mutex;
 use std::{io, mem};
@@ -128,7 +129,7 @@ pub trait WinterHandle {
         context: &mut Self::Context,
         size: size_t,
         offset: off_t,
-        w: &mut dyn ZeroCopyWriter,
+        w: &mut dyn Write,
     ) -> io::Result<size_t>;
 
     /// Persists the provided data into storage
@@ -137,7 +138,7 @@ pub trait WinterHandle {
         context: &mut Self::Context,
         size: size_t,
         offset: off_t,
-        r: &mut dyn ZeroCopyReader,
+        r: &mut dyn Read,
     ) -> io::Result<size_t>;
 
     /// Like write but guaranteed to append at the end of the file
@@ -145,7 +146,7 @@ pub trait WinterHandle {
         &mut self,
         context: &mut Self::Context,
         size: size_t,
-        r: &mut dyn ZeroCopyReader,
+        r: &mut dyn Read,
     ) -> io::Result<size_t>;
 
     /// Set an extended attribute on the inode
@@ -878,6 +879,110 @@ where
             let result_inode = tree.get_inode(fh.get_inode().get_id())?;
             let entry = self.make_entry(&result_inode, &mut tree)?;
             Ok((entry.attr, entry.attr_timeout))
+        })
+    }
+
+    fn readlink(&self, _ctx: &Context, inode: Self::Inode) -> io::Result<Vec<u8>> {
+        self.with_context(|op_ctx| {
+            let mut tree = self.fs.tree(op_ctx)?;
+            let inode_obj = tree.get_inode(inode)?;
+
+            // Check if it's actually a symlink
+            if inode_obj.get_mode() & libc::S_IFMT != S_IFLNK {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Not a symbolic link",
+                ));
+            }
+
+            // Get size before we open the handle
+            let core = inode_obj.make_entry()?;
+            let size = core.st_size as usize;
+
+            if size == 0 {
+                return Ok(Vec::new());
+            }
+
+            // Drop the tree before opening the handle
+            drop(tree);
+
+            // Open the file to read the link target
+            let mut handle = self.fs.open(op_ctx, inode, libc::O_RDONLY as u32)?;
+
+            // Read the entire content (link target)
+            let mut buffer = vec![0u8; size];
+            let mut cursor = io::Cursor::new(&mut buffer);
+            let bytes_read = handle.read(op_ctx, size, 0, &mut cursor)?;
+
+            if bytes_read != size {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "Could not read complete link target",
+                ));
+            }
+
+            Ok(buffer)
+        })
+    }
+
+    /// The storage of symlinks happens basically by leveraging the underlying
+    /// storage layer that we have. That's dumb but it works and requires no
+    /// extra work from the FS implementer.
+    fn symlink(
+        &self,
+        ctx: &Context,
+        linkname: &CStr,
+        parent: Self::Inode,
+        name: &CStr,
+    ) -> io::Result<Entry> {
+        self.with_context(|op_ctx| {
+            let name_str = name
+                .to_str()
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Invalid UTF-8"))?;
+            let linkname_bytes = linkname.to_bytes();
+
+            let mut tree = self.fs.tree(op_ctx)?;
+
+            // Check if the name already exists
+            let existing_id = tree.lookup(parent, name_str)?;
+            if existing_id != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "File already exists",
+                ));
+            }
+
+            // Create a new inode for the symlink with S_IFLNK mode
+            let mode = S_IFLNK | 0o777;
+            let symlink_inode = tree.create_inode(mode, ctx.uid, ctx.gid)?;
+            let symlink_id = symlink_inode.get_id();
+
+            // Add the symlink to the parent directory
+            tree.add_child(parent, symlink_id, name_str)?;
+
+            // Drop the tree before opening the handle to avoid borrowing issues
+            drop(tree);
+
+            // Open the symlink file and write the target path
+            let mut handle = self.fs.open(op_ctx, symlink_id, libc::O_WRONLY as u32)?;
+
+            // Write the link target as the file content
+            let mut cursor = io::Cursor::new(linkname_bytes);
+            let bytes_written = handle.write(op_ctx, linkname_bytes.len(), 0, &mut cursor)?;
+
+            if bytes_written != linkname_bytes.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "Failed to write complete link target",
+                ));
+            }
+
+            // Return the entry for the created symlink
+            let mut tree = self.fs.tree(op_ctx)?;
+            let symlink_inode = tree.get_inode(symlink_id)?;
+            let entry = self.make_entry(&symlink_inode, &mut tree)?;
+            self.increase_lookup(symlink_id, 1);
+            Ok(entry)
         })
     }
 

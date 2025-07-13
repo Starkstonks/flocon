@@ -14,7 +14,7 @@ use diesel::r2d2::{ConnectionManager, PooledConnection};
 use diesel::sql_types::Integer;
 use fuse_backend_rs::api::filesystem::{ZeroCopyReader, ZeroCopyWriter};
 use libc::{S_IFDIR, blksize_t, gid_t, mode_t, off_t, size_t, uid_t};
-use std::io::{Error, ErrorKind};
+use std::io::{Error, ErrorKind, Read, Write};
 use std::path::Path;
 use std::time::Duration;
 
@@ -499,7 +499,7 @@ impl WinterHandle for FloconHandle {
         context: &mut Self::Context,
         size: size_t,
         offset: off_t,
-        w: &mut dyn ZeroCopyWriter,
+        w: &mut dyn Write,
     ) -> std::io::Result<size_t> {
         use crate::schema::block::dsl::{block, first_byte, inode_id, last_byte};
 
@@ -551,7 +551,7 @@ impl WinterHandle for FloconHandle {
         context: &mut Self::Context,
         size: size_t,
         offset: off_t,
-        r: &mut dyn ZeroCopyReader,
+        r: &mut dyn Read,
     ) -> std::io::Result<size_t> {
         use crate::schema::block::dsl::{block, first_byte, inode_id, last_byte};
         use crate::schema::inode::dsl::{inode, size as inode_size};
@@ -640,7 +640,7 @@ impl WinterHandle for FloconHandle {
         &mut self,
         context: &mut Self::Context,
         size: size_t,
-        r: &mut dyn ZeroCopyReader,
+        r: &mut dyn Read,
     ) -> std::io::Result<size_t> {
         use crate::schema::block;
         use crate::schema::block::dsl::{block as block_table, inode_id, last_byte};
