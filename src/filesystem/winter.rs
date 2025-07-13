@@ -49,6 +49,11 @@ pub trait WinterTree {
         size: size_t,
         offset: size_t,
     ) -> io::Result<Vec<(String, u64)>>;
+
+    /// Explicitly deletes an inode and its data from storage. Essentially it's
+    /// not because an inode has zero link remaining that it should be deleted,
+    /// instead this function will be called to do the job.
+    fn delete_inode(&mut self, inode: u64) -> io::Result<()>;
 }
 
 /// That's the core of the attributes we're going to need for an inode Entry,
@@ -262,6 +267,7 @@ pub struct WinterFsHandler<FS: WinterFs> {
     fs: FS,
     next_handle: Mutex<u64>,
     handles: Mutex<HashMap<u64, FS::Handle>>,
+    lookup_counts: Mutex<HashMap<u64, u64>>,
 }
 
 impl<FS: WinterFs> WinterFsHandler<FS> {
@@ -270,7 +276,72 @@ impl<FS: WinterFs> WinterFsHandler<FS> {
             fs,
             next_handle: Mutex::new(1),
             handles: Mutex::new(HashMap::new()),
+            lookup_counts: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Some operations will increase the "lookup count" of a given inode. This
+    /// is essentially how many parts of the system might still be referencing
+    /// this inode. For example even after a file is deleted you can still
+    /// write to it. It's because of this lookup count.
+    fn increase_lookup(&self, inode: u64, amount: u64) {
+        let mut counts = self.lookup_counts.lock().unwrap();
+        let count = counts.entry(inode).or_insert(0);
+        *count = count.saturating_add(amount);
+    }
+
+    /// Decreases the lookup count on a given inode, and at the same time
+    /// perform garbage collection on said inode. For starters, when the count
+    /// drops to zero then we stop keeping scores on the lookup count. But also
+    /// when there are no links left to that inode then we know it needs to be
+    /// removed from storage.
+    fn decrease_lookup(&self, inode: u64, amount: u64, tree: &mut FS::Tree<'_>) -> io::Result<()> {
+        tracing::trace!(
+            "decrease_lookup called for inode {} with amount {}",
+            inode,
+            amount
+        );
+
+        let mut counts = self.lookup_counts.lock().unwrap();
+        if let Some(count) = counts.get_mut(&inode) {
+            let old_count = *count;
+            *count = count.saturating_sub(amount);
+            tracing::trace!(
+                "decrease_lookup: inode {} count changed from {} to {}",
+                inode,
+                old_count,
+                *count
+            );
+
+            if *count == 0 {
+                counts.remove(&inode);
+                tracing::debug!(
+                    "decrease_lookup: inode {} lookup count reached 0, checking link count for deletion",
+                    inode
+                );
+
+                let parents = tree.find_parents_of(inode)?;
+                tracing::debug!(
+                    "decrease_lookup: inode {} has {} parent links",
+                    inode,
+                    parents.len()
+                );
+
+                if parents.is_empty() {
+                    tracing::info!(
+                        "decrease_lookup: deleting inode {} as it has no remaining links or lookups",
+                        inode
+                    );
+                    tree.delete_inode(inode)?;
+                }
+            }
+        } else {
+            tracing::debug!(
+                "decrease_lookup called for inode {} which is not tracked. This is safe to ignore (e.g., after a restart).",
+                inode
+            );
+        }
+        Ok(())
     }
 
     /// Helper method to work with a handle if it exists
@@ -652,11 +723,64 @@ where
             let file_id = tree.lookup(parent, name_str)?;
 
             if file_id > 0 {
-                self.make_entry(&tree.get_inode(file_id)?, &mut tree)
+                let entry = self.make_entry(&tree.get_inode(file_id)?, &mut tree)?;
+                self.increase_lookup(file_id, 1);
+                Ok(entry)
             } else {
                 self.make_entry(&tree.empty_inode(), &mut tree)
             }
         })
+    }
+
+    fn forget(&self, _ctx: &Context, inode: Self::Inode, count: u64) {
+        tracing::debug!("forget called for inode {} with count {}", inode, count);
+
+        let result = self.with_context(|op_ctx| {
+            let mut tree = self.fs.tree(op_ctx)?;
+            self.decrease_lookup(inode, count, &mut tree)
+        });
+
+        match result {
+            Ok(()) => {
+                tracing::debug!("forget completed successfully for inode {}", inode);
+            }
+            Err(e) => {
+                tracing::error!(
+                    "forget failed for inode {} with count {}: {:?}",
+                    inode,
+                    count,
+                    e
+                );
+            }
+        }
+    }
+
+    fn batch_forget(&self, _ctx: &Context, requests: Vec<(Self::Inode, u64)>) {
+        tracing::debug!("batch_forget called with {} requests", requests.len());
+
+        let result = self.with_context(|op_ctx| {
+            let mut tree = self.fs.tree(op_ctx)?;
+
+            for (inode, count) in &requests {
+                tracing::debug!(
+                    "  processing forget for inode {} with count {}",
+                    inode,
+                    count
+                );
+                self.decrease_lookup(*inode, *count, &mut tree)?;
+            }
+
+            Ok(())
+        });
+
+        match result {
+            Ok(()) => {
+                tracing::debug!("batch_forget completed successfully");
+            }
+            Err(e) => {
+                tracing::error!("batch_forget failed: {:?}", e);
+            }
+        }
     }
 
     fn getattr(
@@ -783,7 +907,9 @@ where
             let file = tree.create_inode(full_mode, ctx.uid, ctx.gid)?;
             tree.add_child(parent, file.get_id(), name_str)?;
 
-            Ok(self.make_entry(&file, &mut tree)?)
+            let entry = self.make_entry(&file, &mut tree)?;
+            self.increase_lookup(file.get_id(), 1);
+            Ok(entry)
         })
     }
 
@@ -917,7 +1043,9 @@ where
             tree.add_child(newparent, inode, name_str)?;
 
             // Return the entry for the linked file
-            self.make_entry(&file, &mut tree)
+            let entry = self.make_entry(&file, &mut tree)?;
+            self.increase_lookup(inode, 1);
+            Ok(entry)
         })
     }
 
@@ -949,8 +1077,10 @@ where
                     let file = tree.create_inode(full_mode, ctx.uid, ctx.gid)?;
                     let new_id = file.get_id();
                     tree.add_child(parent, new_id, name_str)?;
+                    self.increase_lookup(new_id, 1);
                     new_id
                 } else {
+                    self.increase_lookup(existing_id, 1);
                     existing_id
                 };
 
@@ -1087,6 +1217,34 @@ where
 
             Ok(())
         })
+    }
+
+    fn release(
+        &self,
+        _ctx: &Context,
+        _inode: Self::Inode,
+        _flags: u32,
+        handle: Self::Handle,
+        flush: bool,
+        _flock_release: bool,
+        _lock_owner: Option<u64>,
+    ) -> io::Result<()> {
+        if handle == 0 {
+            return Ok(());
+        }
+
+        // If flush is requested, flush the handle first
+        if flush {
+            self.with_context(|op_ctx| {
+                self.with_handle_mut(handle, |fh| fh.flush(op_ctx))?
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid handle"))?
+            })?;
+        }
+
+        // Remove the handle from our map
+        self.remove_handle(handle);
+
+        Ok(())
     }
 
     fn statfs(&self, _ctx: &Context, _inode: Self::Inode) -> io::Result<statvfs64> {
@@ -1280,6 +1438,10 @@ where
         let entries = self.inner_readdir(ctx, inode, handle, size, offset)?;
 
         for (owned_dir_entry, entry) in entries {
+            if owned_dir_entry.name != b"." && owned_dir_entry.name != b".." {
+                self.increase_lookup(entry.inode, 1);
+            }
+
             if add_entry(owned_dir_entry.as_dir_entry(), entry)? == 0 {
                 break;
             }
@@ -1296,5 +1458,21 @@ where
         handle: Self::Handle,
     ) -> io::Result<()> {
         self.fsync(ctx, inode, datasync, handle)
+    }
+
+    fn releasedir(
+        &self,
+        _ctx: &Context,
+        _inode: Self::Inode,
+        _flags: u32,
+        handle: Self::Handle,
+    ) -> io::Result<()> {
+        if handle == 0 {
+            return Ok(());
+        }
+
+        self.remove_handle(handle);
+
+        Ok(())
     }
 }

@@ -173,6 +173,44 @@ impl<'ctx> WinterTree for FloconTree<'ctx> {
             .map(|(name, id)| (name, id as u64))
             .collect())
     }
+
+    fn delete_inode(&mut self, inode: u64) -> std::io::Result<()> {
+        use crate::schema::block::dsl::{block, inode_id as block_inode_id};
+        use crate::schema::inode::dsl::inode as inode_table;
+        use crate::schema::xattr::dsl::{inode_id as xattr_inode_id, xattr};
+
+        let the_inode_id = inode as i32;
+
+        // Check if there are any remaining links to this inode
+        let link_count = link
+            .filter(child_id.eq(the_inode_id))
+            .count()
+            .get_result::<i64>(&mut self.ctx.conn)
+            .map_err(|e| Error::new(ErrorKind::Other, e))?;
+
+        if link_count > 0 {
+            return Err(Error::from_raw_os_error(libc::EBUSY));
+        }
+
+        // Delete all blocks associated with this inode
+        diesel::delete(block)
+            .filter(block_inode_id.eq(the_inode_id))
+            .execute(&mut self.ctx.conn)
+            .map_err(|e| Error::new(ErrorKind::Other, e))?;
+
+        // Delete all xattrs associated with this inode
+        diesel::delete(xattr)
+            .filter(xattr_inode_id.eq(the_inode_id))
+            .execute(&mut self.ctx.conn)
+            .map_err(|e| Error::new(ErrorKind::Other, e))?;
+
+        // Finally, delete the inode itself
+        diesel::delete(inode_table.find(the_inode_id))
+            .execute(&mut self.ctx.conn)
+            .map_err(|e| Error::new(ErrorKind::Other, e))?;
+
+        Ok(())
+    }
 }
 
 pub struct FloconInode {
@@ -361,7 +399,7 @@ impl WinterHandle for FloconHandle {
 
             // Trim blocks that span the truncation point
             for spanning_block in spanning_blocks {
-                let mut working_block = WorkingBlock::from_model(spanning_block);
+                let working_block = WorkingBlock::from_model(spanning_block);
                 if let Ok(trimmed) =
                     working_block.clip(working_block.first_byte, truncate_point - 1)
                 {
