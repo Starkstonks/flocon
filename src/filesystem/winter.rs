@@ -923,6 +923,23 @@ where
         })
     }
 
+    fn flush(
+        &self,
+        _ctx: &Context,
+        _inode: Self::Inode,
+        handle: Self::Handle,
+        _lock_owner: u64,
+    ) -> io::Result<()> {
+        if handle == 0 {
+            return Ok(());
+        }
+
+        self.with_context(|op_ctx| {
+            self.with_handle_mut(handle, |fh| fh.flush(op_ctx))?
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid handle"))?
+        })
+    }
+
     fn readdir(
         &self,
         ctx: &Context,
