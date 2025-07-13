@@ -45,13 +45,13 @@ Flocon is in early development and currently supports:
 -   ✅ Efficient block-based storage with automatic deduplication of zero blocks
 -   ✅ SQLite-based storage with transaction support
 -   ✅ Command-line tools for creating and mounting filesystems
+-   ✅ Extended attributes (xattr)
+-   ✅ Symbolic links
+-   ✅ Special files (devices, sockets, FIFOs)
 
 Not yet implemented:
 
 -   ❌ Multi-layer support (combining multiple SQLite files)
--   ❌ Extended attributes (xattr)
--   ❌ Symbolic links
--   ❌ Special files (devices, sockets, FIFOs)
 -   ❌ virtiofs server mode
 
 ## Installation
@@ -168,3 +168,4 @@ Built with:
     FUSE integration
 -   [Diesel](https://diesel.rs/) for SQLite ORM
 -   [SQLite](https://www.sqlite.org/) for the storage engine
+-   [Rust](https://www.rust-lang.org/) 2024 edition
