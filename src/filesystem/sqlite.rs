@@ -126,6 +126,7 @@ impl FileSystemManager {
             uid: uid as i32,
             gid: gid as i32,
             size: 0,
+            rdev: 0,
             atime: now.into(),
             mtime: now.into(),
             ctime: now.into(),

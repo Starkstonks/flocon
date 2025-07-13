@@ -7,7 +7,8 @@ use fuse_backend_rs::api::filesystem::{
 };
 use libc::{
     O_EXCL, O_TRUNC, RENAME_EXCHANGE, RENAME_NOREPLACE, S_IFDIR, S_IFLNK, S_IFREG, blkcnt64_t,
-    blksize_t, c_ulong, gid_t, ino64_t, mode_t, off_t, size_t, stat64, statvfs64, time_t, uid_t,
+    blksize_t, c_ulong, dev_t, gid_t, ino64_t, mode_t, off_t, size_t, stat64, statvfs64, time_t,
+    uid_t,
 };
 use std::collections::HashMap;
 use std::ffi::CStr;
@@ -29,8 +30,13 @@ pub trait WinterTree {
 
     fn find_parents_of(&mut self, inode: u64) -> io::Result<Vec<u64>>;
 
-    fn create_inode(&mut self, mode: mode_t, uid_t: uid_t, gid_t: gid_t)
-    -> io::Result<Self::Inode>;
+    fn create_inode(
+        &mut self,
+        mode: mode_t,
+        uid_t: uid_t,
+        gid_t: gid_t,
+        rdev: dev_t,
+    ) -> io::Result<Self::Inode>;
 
     fn add_child(&mut self, parent: u64, child: u64, name: &str) -> io::Result<()>;
 
@@ -71,6 +77,7 @@ pub struct EntryCore {
     pub st_mode: mode_t,
     pub st_uid: uid_t,
     pub st_gid: gid_t,
+    pub st_rdev: dev_t,
 }
 
 pub trait WinterInode {
@@ -507,6 +514,7 @@ impl<FS: WinterFs> WinterFsHandler<FS> {
         st.st_mtime_nsec = core.st_mtime_nsec;
         st.st_ctime = core.st_ctime;
         st.st_ctime_nsec = core.st_ctime_nsec;
+        st.st_rdev = core.st_rdev;
 
         Ok(Entry {
             inode: core.st_ino,
@@ -954,7 +962,7 @@ where
 
             // Create a new inode for the symlink with S_IFLNK mode
             let mode = S_IFLNK | 0o777;
-            let symlink_inode = tree.create_inode(mode, ctx.uid, ctx.gid)?;
+            let symlink_inode = tree.create_inode(mode, ctx.uid, ctx.gid, 0)?;
             let symlink_id = symlink_inode.get_id();
 
             // Add the symlink to the parent directory
@@ -986,6 +994,42 @@ where
         })
     }
 
+    fn mknod(
+        &self,
+        ctx: &Context,
+        parent: Self::Inode,
+        name: &CStr,
+        mode: u32,
+        rdev: u32,
+        umask: u32,
+    ) -> io::Result<Entry> {
+        self.with_context(|op_ctx| {
+            let name_str = name
+                .to_str()
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Invalid UTF-8"))?;
+
+            let mut tree = self.fs.tree(op_ctx)?;
+
+            let existing_id = tree.lookup(parent, name_str)?;
+            if existing_id != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "File already exists",
+                ));
+            }
+
+            let full_mode = mode & !umask;
+            let node = tree.create_inode(full_mode, ctx.uid, ctx.gid, rdev as dev_t)?;
+            let node_id = node.get_id();
+
+            tree.add_child(parent, node_id, name_str)?;
+
+            let entry = self.make_entry(&node, &mut tree)?;
+            self.increase_lookup(node_id, 1);
+            Ok(entry)
+        })
+    }
+
     fn mkdir(
         &self,
         ctx: &Context,
@@ -1009,7 +1053,7 @@ where
             }
 
             let full_mode = S_IFDIR | (mode & !umask);
-            let file = tree.create_inode(full_mode, ctx.uid, ctx.gid)?;
+            let file = tree.create_inode(full_mode, ctx.uid, ctx.gid, 0)?;
             tree.add_child(parent, file.get_id(), name_str)?;
 
             let entry = self.make_entry(&file, &mut tree)?;
@@ -1179,7 +1223,7 @@ where
 
                 let file_id = if existing_id == 0 {
                     let full_mode = S_IFREG | (args.mode & !args.umask);
-                    let file = tree.create_inode(full_mode, ctx.uid, ctx.gid)?;
+                    let file = tree.create_inode(full_mode, ctx.uid, ctx.gid, 0)?;
                     let new_id = file.get_id();
                     tree.add_child(parent, new_id, name_str)?;
                     self.increase_lookup(new_id, 1);

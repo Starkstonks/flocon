@@ -1,10 +1,11 @@
 -- Main inode table to store file/directory metadata
 create table inode (
-    id integer primary key,
+    id integer primary key not null,
     mode integer not null,           -- File type and permissions
     uid integer not null,            -- User ID
     gid integer not null,            -- Group ID
     size integer not null default 0, -- File size in bytes
+    rdev integer not null default 0, -- Raw device ID
     atime datetime not null,         -- Access time
     mtime datetime not null,         -- Modification time
     ctime datetime not null,         -- Change time
@@ -24,7 +25,7 @@ create table link (
 
 -- File data storage in blocks
 create table block (
-    id integer primary key,
+    id integer primary key not null,
     inode_id integer not null,
     first_byte integer not null,    -- Starting byte position (inclusive)
     last_byte integer not null,     -- Ending byte position (inclusive)
@@ -47,4 +48,5 @@ create table xattr (
 -- Indexes for performance
 create index idx_link_child on link(child_id);
 create index idx_block_range on block(inode_id, first_byte, last_byte);
+create index idx_block_inode_bytes on block(inode_id, first_byte, last_byte);
 create index idx_inode_mode on inode(mode);

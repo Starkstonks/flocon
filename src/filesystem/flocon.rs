@@ -12,8 +12,7 @@ use diesel::dsl::sql;
 use diesel::prelude::*;
 use diesel::r2d2::{ConnectionManager, PooledConnection};
 use diesel::sql_types::Integer;
-use fuse_backend_rs::api::filesystem::{ZeroCopyReader, ZeroCopyWriter};
-use libc::{S_IFDIR, blksize_t, gid_t, mode_t, off_t, size_t, uid_t};
+use libc::{S_IFDIR, blksize_t, dev_t, gid_t, mode_t, off_t, size_t, uid_t};
 use std::io::{Error, ErrorKind, Read, Write};
 use std::path::Path;
 use std::time::Duration;
@@ -65,6 +64,7 @@ impl<'ctx> WinterTree for FloconTree<'ctx> {
                 uid: 0,
                 gid: 0,
                 size: 0,
+                rdev: 0,
                 atime: epoch.into(),
                 mtime: epoch.into(),
                 ctime: epoch.into(),
@@ -103,6 +103,7 @@ impl<'ctx> WinterTree for FloconTree<'ctx> {
         mode: mode_t,
         uid_t: uid_t,
         gid_t: gid_t,
+        rdev: dev_t,
     ) -> std::io::Result<Self::Inode> {
         use crate::schema::inode;
 
@@ -112,6 +113,7 @@ impl<'ctx> WinterTree for FloconTree<'ctx> {
             uid: uid_t as i32,
             gid: gid_t as i32,
             size: 0,
+            rdev: rdev as i32,
             atime: now.into(),
             mtime: now.into(),
             ctime: now.into(),
@@ -243,6 +245,7 @@ impl WinterInode for FloconInode {
             st_mode: self.model.mode as mode_t,
             st_uid: self.model.uid as uid_t,
             st_gid: self.model.gid as gid_t,
+            st_rdev: self.model.rdev as dev_t,
         })
     }
 
