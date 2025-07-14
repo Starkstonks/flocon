@@ -505,7 +505,7 @@ impl<FS: WinterFs> WinterFsHandler<FS> {
         st.st_mode = core.st_mode;
         st.st_uid = core.st_uid;
         st.st_gid = core.st_gid;
-        st.st_size = core.st_size;
+        st.st_size = core.st_size as off_t;
         st.st_blksize = bs;
         st.st_blocks = ((core.st_size + bs - 1) / bs) as blkcnt64_t;
         st.st_atime = core.st_atime;

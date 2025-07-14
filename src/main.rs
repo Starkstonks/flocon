@@ -9,8 +9,6 @@ use tracing::{Level, error, info};
 use tracing_subscriber;
 
 mod filesystem;
-mod models;
-mod schema;
 
 use crate::filesystem::{FileSystemManager, Flocon, WinterFsHandler};
 
@@ -167,7 +165,12 @@ fn flocon_mount(
     let server = Server::new(fs_arc);
 
     info!("Mounting filesystem at {:?}", mount_point);
-    let mut session = FuseSession::new(mount_point.as_path(), "flocon", "", false)?;
+    let mut session = FuseSession::new(
+        mount_point.as_path(),
+        image.to_str().unwrap(),
+        "flocon",
+        false,
+    )?;
     session.mount()?;
 
     let (tx, rx) = channel();

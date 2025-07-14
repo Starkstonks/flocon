@@ -1,18 +1,16 @@
-use crate::models::block::{Block, NewBlock};
-use fuse_backend_rs::api::filesystem::ZeroCopyWriter;
 use std::io;
 use std::io::Write;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct WorkingBlock {
-    pub id: Option<i32>,
-    pub first_byte: i32,
-    pub last_byte: i32,
+    pub id: Option<u64>,
+    pub first_byte: u64,
+    pub last_byte: u64,
     pub data: Option<Vec<u8>>,
 }
 
 impl WorkingBlock {
-    pub fn new(id: Option<i32>, first_byte: i32, last_byte: i32, data: Option<Vec<u8>>) -> Self {
+    pub fn new(id: Option<u64>, first_byte: u64, last_byte: u64, data: Option<Vec<u8>>) -> Self {
         let block = Self {
             id,
             first_byte,
@@ -24,34 +22,14 @@ impl WorkingBlock {
         {
             if let Some(ref data) = block.data {
                 debug_assert_eq!(
-                    data.len() as i32,
-                    block.last_byte - block.first_byte + 1,
+                    data.len(),
+                    (block.last_byte - block.first_byte + 1) as usize,
                     "Data length is inconsistent with block coordinates"
                 );
             }
         }
 
         block
-    }
-
-    /// Create WorkingBlock from a Diesel Block model
-    pub fn from_model(block: Block) -> Self {
-        Self {
-            id: Some(block.id),
-            first_byte: block.first_byte,
-            last_byte: block.last_byte,
-            data: block.data,
-        }
-    }
-
-    /// Convert to NewBlock for insertion (requires inode_id)
-    pub fn to_new_block(&self, inode_id: i32) -> NewBlock {
-        NewBlock {
-            inode_id,
-            first_byte: self.first_byte,
-            last_byte: self.last_byte,
-            data: self.data.as_deref(),
-        }
     }
 
     /// The data might be actual data but it might also be zero-filled. When
@@ -65,7 +43,7 @@ impl WorkingBlock {
     }
 
     /// Generates a new block clipped within the given boundaries
-    pub fn clip(&self, first_byte: i32, last_byte: i32) -> Result<WorkingBlock, String> {
+    pub fn clip(&self, first_byte: u64, last_byte: u64) -> Result<WorkingBlock, String> {
         assert!(first_byte <= last_byte, "first_byte must be <= last_byte");
 
         let clipped_first = self.first_byte.max(first_byte);
@@ -95,7 +73,7 @@ impl WorkingBlock {
 
     /// Removes the given range from current block and returns the list of
     /// new blocks after this operation (either zero, one or two)
-    pub fn remove(&self, first_byte: i32, last_byte: i32) -> Vec<WorkingBlock> {
+    pub fn remove(&self, first_byte: u64, last_byte: u64) -> Vec<WorkingBlock> {
         assert!(first_byte <= last_byte, "first_byte must be <= last_byte");
 
         if last_byte < self.first_byte || first_byte > self.last_byte {
@@ -212,7 +190,7 @@ impl Sequence {
     }
 
     /// Clips the sequence within the given boundaries
-    pub fn clip(&self, first_byte: i32, last_byte: i32) -> Sequence {
+    pub fn clip(&self, first_byte: u64, last_byte: u64) -> Sequence {
         let mut clipped = Vec::new();
 
         for block in &self.blocks {
