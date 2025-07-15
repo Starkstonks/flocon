@@ -271,11 +271,16 @@ impl WorkingBlock {
 
         let offset = clipped_first - self.first_byte;
         let size = clipped_last - clipped_first + 1;
+        let new_id = if clipped_first == self.first_byte && clipped_last == self.last_byte {
+            self.id
+        } else {
+            None
+        };
 
         self.source
             .slice(offset, size)
             .map_err(|e| e.to_string())
-            .map(|source| WorkingBlock::new(self.id, clipped_first, clipped_last, source))
+            .map(|source| WorkingBlock::new(new_id, clipped_first, clipped_last, source))
     }
 
     /// Removes the given range from current block and returns the list of
@@ -423,5 +428,352 @@ impl Sequence {
 
         new_blocks.sort_by_key(|b| b.first_byte);
         Sequence::new(new_blocks)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use r2d2::Pool;
+    use r2d2_sqlite::SqliteConnectionManager;
+    use rusqlite::{OpenFlags, params};
+    use std::sync::Arc;
+
+    // Helper to create a test context with in-memory SQLite
+    fn create_test_context() -> FloconContext {
+        let manager = SqliteConnectionManager::memory()
+            .with_flags(OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE);
+        let pool = Pool::new(manager).unwrap();
+        let conn = pool.get().unwrap();
+
+        // Create test table
+        conn.execute(
+            "CREATE TABLE block (
+                id INTEGER PRIMARY KEY,
+                data BLOB
+            )",
+            [],
+        )
+        .unwrap();
+
+        FloconContext { conn }
+    }
+
+    /// Inserts a test block with the provided data and returns the ID of said
+    /// block
+    fn insert_test_block(context: &mut FloconContext, data: &[u8]) -> u64 {
+        context
+            .conn
+            .execute("INSERT INTO block (data) VALUES (?1)", params![data])
+            .unwrap();
+
+        context.conn.last_insert_rowid() as u64
+    }
+
+    #[test]
+    fn test_memory_data_source_basic() {
+        let data = Arc::new(vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        let source = MemoryDataSource::new(data.clone(), 0, 10).unwrap();
+
+        assert_eq!(source.size().unwrap(), 10);
+
+        let mut context = create_test_context();
+        let mut output = Vec::new();
+        let bytes_written = source.read_to(&mut context, &mut output).unwrap();
+
+        assert_eq!(bytes_written, 10);
+        assert_eq!(output, vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    }
+
+    #[test]
+    fn test_memory_data_source_slice() {
+        let data = Arc::new(vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        let source = MemoryDataSource::new(data.clone(), 0, 10).unwrap();
+
+        // Slice from offset 2, length 5
+        let sliced = source.slice(2, 5).unwrap();
+        assert_eq!(sliced.size().unwrap(), 5);
+
+        let mut context = create_test_context();
+        let mut output = Vec::new();
+        sliced.read_to(&mut context, &mut output).unwrap();
+
+        assert_eq!(output, vec![2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn test_memory_data_source_invalid_bounds() {
+        let data = Arc::new(vec![0, 1, 2, 3, 4]);
+
+        // Offset out of bounds
+        assert!(MemoryDataSource::new(data.clone(), 10, 1).is_err());
+
+        // Size exceeds available data
+        assert!(MemoryDataSource::new(data.clone(), 0, 10).is_err());
+
+        // Valid source, invalid slice
+        let source = MemoryDataSource::new(data.clone(), 0, 5).unwrap();
+        assert!(source.slice(3, 3).is_err()); // Would exceed bounds
+    }
+
+    #[test]
+    fn test_zero_data_source() {
+        let source = ZeroDataSource::new(10);
+        assert_eq!(source.size().unwrap(), 10);
+
+        let mut context = create_test_context();
+        let mut output = Vec::new();
+        let bytes_written = source.read_to(&mut context, &mut output).unwrap();
+
+        assert_eq!(bytes_written, 10);
+        assert_eq!(output, vec![0; 10]);
+    }
+
+    #[test]
+    fn test_zero_data_source_slice() {
+        let source = ZeroDataSource::new(20);
+        let sliced = source.slice(5, 10).unwrap();
+
+        assert_eq!(sliced.size().unwrap(), 10);
+
+        let mut context = create_test_context();
+        let mut output = Vec::new();
+        sliced.read_to(&mut context, &mut output).unwrap();
+
+        assert_eq!(output, vec![0; 10]);
+    }
+
+    #[test]
+    fn test_sqlite_data_source() {
+        let mut context = create_test_context();
+
+        // Insert test data
+        let block_id = insert_test_block(&mut context, b"0123456789");
+
+        let source = SqliteDataSource::new(block_id, 0, 10);
+        assert_eq!(source.size().unwrap(), 10);
+
+        let mut output = Vec::new();
+        let bytes_written = source.read_to(&mut context, &mut output).unwrap();
+        let _output_as_string = String::from_utf8(output.clone()).unwrap();
+
+        assert_eq!(bytes_written, 10);
+        assert_eq!(output, b"0123456789");
+    }
+
+    #[test]
+    fn test_sqlite_data_source_slice() {
+        let mut context = create_test_context();
+
+        // Insert test data
+        let block_id = insert_test_block(&mut context, b"0123456789");
+
+        let source = SqliteDataSource::new(block_id, 0, 10);
+        let sliced = source.slice(3, 4).unwrap();
+
+        assert_eq!(sliced.size().unwrap(), 4);
+
+        let mut output = Vec::new();
+        sliced.read_to(&mut context, &mut output).unwrap();
+
+        assert_eq!(output, b"3456");
+    }
+
+    #[test]
+    fn test_working_block_clip() {
+        let mut context = create_test_context();
+
+        // Block before range
+        let data = MemoryDataSource::from_data(vec![0, 1, 2, 3, 4, 5]).unwrap();
+        let block = WorkingBlock::new(None, 0, 5, Box::new(data));
+        let result = block.clip(10, 20);
+        assert!(result.is_err());
+
+        // Block cut by range start
+        let data = MemoryDataSource::from_data(b"0123456789".to_vec()).unwrap();
+        let block = WorkingBlock::new(None, 5, 14, Box::new(data));
+        let clipped = block.clip(10, 20).unwrap();
+        assert_eq!(clipped.first_byte, 10);
+        assert_eq!(clipped.last_byte, 14);
+        assert_eq!(clipped.concrete_data(&mut context), b"56789");
+
+        // Block cut by range end
+        let data = MemoryDataSource::from_data(b"0123456789".to_vec()).unwrap();
+        let block = WorkingBlock::new(None, 17, 26, Box::new(data));
+        let clipped = block.clip(10, 20).unwrap();
+        assert_eq!(clipped.first_byte, 17);
+        assert_eq!(clipped.last_byte, 20);
+        assert_eq!(clipped.concrete_data(&mut context), b"0123");
+
+        // Block within range
+        let data = MemoryDataSource::from_data(b"0123456789".to_vec()).unwrap();
+        let block = WorkingBlock::new(None, 10, 19, Box::new(data));
+        let clipped = block.clip(10, 20).unwrap();
+        assert_eq!(clipped.first_byte, 10);
+        assert_eq!(clipped.last_byte, 19);
+        assert_eq!(clipped.concrete_data(&mut context), b"0123456789");
+
+        // Range within block
+        let data = MemoryDataSource::from_data(b"0123456789".to_vec()).unwrap();
+        let block = WorkingBlock::new(None, 10, 19, Box::new(data));
+        let clipped = block.clip(11, 18).unwrap();
+        assert_eq!(clipped.first_byte, 11);
+        assert_eq!(clipped.last_byte, 18);
+        assert_eq!(clipped.concrete_data(&mut context), b"12345678");
+    }
+
+    #[test]
+    fn test_working_block_concrete_data() {
+        let mut context = create_test_context();
+
+        // Block with zeros
+        let source = ZeroDataSource::new(10);
+        let block = WorkingBlock::new(None, 10, 19, Box::new(source));
+        let clipped = block.clip(10, 20).unwrap();
+        assert_eq!(clipped.concrete_data(&mut context), vec![0; 10]);
+
+        // Range within block
+        let source = ZeroDataSource::new(10);
+        let block = WorkingBlock::new(None, 10, 19, Box::new(source));
+        let clipped = block.clip(11, 18).unwrap();
+        assert_eq!(clipped.concrete_data(&mut context), vec![0; 8]);
+
+        // Range within block (with data)
+        let data = MemoryDataSource::from_data(b"0123456789".to_vec()).unwrap();
+        let block = WorkingBlock::new(None, 10, 19, Box::new(data));
+        let clipped = block.clip(11, 18).unwrap();
+        assert_eq!(clipped.concrete_data(&mut context), b"12345678");
+    }
+
+    #[test]
+    fn test_working_block_remove() {
+        let mut context = create_test_context();
+
+        let data = MemoryDataSource::from_data(b"0123456789".to_vec()).unwrap();
+        let block = WorkingBlock::new(Some(1), 5, 14, Box::new(data));
+
+        // No intersect
+        let result = block.remove(0, 4);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].first_byte, 5);
+        assert_eq!(result[0].last_byte, 14);
+
+        // Full intersect
+        let result = block.remove(5, 14);
+        assert_eq!(result.len(), 0);
+
+        // Clip left
+        let result = block.remove(3, 7);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].id, None);
+        assert_eq!(result[0].first_byte, 8);
+        assert_eq!(result[0].last_byte, 14);
+        assert_eq!(result[0].concrete_data(&mut context), b"3456789");
+
+        // Clip right
+        let result = block.remove(12, 14);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].id, None);
+        assert_eq!(result[0].first_byte, 5);
+        assert_eq!(result[0].last_byte, 11);
+        assert_eq!(result[0].concrete_data(&mut context), b"0123456");
+
+        // Punch a hole
+        let result = block.remove(7, 10);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].id, None);
+        assert_eq!(result[0].first_byte, 5);
+        assert_eq!(result[0].last_byte, 6);
+        assert_eq!(result[0].concrete_data(&mut context), b"01");
+        assert_eq!(result[1].id, None);
+        assert_eq!(result[1].first_byte, 11);
+        assert_eq!(result[1].last_byte, 14);
+        assert_eq!(result[1].concrete_data(&mut context), b"6789");
+    }
+
+    #[test]
+    fn test_sequence_clip() {
+        let mut context = create_test_context();
+
+        let b1_data = MemoryDataSource::from_data(b"abcdefghijk".to_vec()).unwrap();
+        let b1 = WorkingBlock::new(Some(1), 0, 10, Box::new(b1_data));
+
+        let b2_data = MemoryDataSource::from_data(b"lmnopq".to_vec()).unwrap();
+        let b2 = WorkingBlock::new(Some(2), 11, 16, Box::new(b2_data));
+
+        let b3_data = MemoryDataSource::from_data(b"rstuvwxyz".to_vec()).unwrap();
+        let b3 = WorkingBlock::new(Some(3), 17, 25, Box::new(b3_data));
+
+        let sequence = Sequence::new(vec![b1, b2, b3]);
+
+        let clipped = sequence.clip(10, 20);
+        assert_eq!(clipped.blocks.len(), 3);
+
+        assert_eq!(clipped.blocks[0].id, None);
+        assert_eq!(clipped.blocks[0].first_byte, 10);
+        assert_eq!(clipped.blocks[0].last_byte, 10);
+        assert_eq!(clipped.blocks[0].concrete_data(&mut context), b"k");
+
+        assert_eq!(clipped.blocks[1].id, Some(2));
+        assert_eq!(clipped.blocks[1].first_byte, 11);
+        assert_eq!(clipped.blocks[1].last_byte, 16);
+        assert_eq!(clipped.blocks[1].concrete_data(&mut context), b"lmnopq");
+
+        assert_eq!(clipped.blocks[2].id, None);
+        assert_eq!(clipped.blocks[2].first_byte, 17);
+        assert_eq!(clipped.blocks[2].last_byte, 20);
+        assert_eq!(clipped.blocks[2].concrete_data(&mut context), b"rstu");
+    }
+
+    #[test]
+    fn test_sequence_concrete_data_with_gaps() {
+        let mut context = create_test_context();
+
+        let b1_data = MemoryDataSource::from_data(b"abc".to_vec()).unwrap();
+        let b1 = WorkingBlock::new(None, 0, 2, Box::new(b1_data));
+
+        let b2_data = MemoryDataSource::from_data(b"def".to_vec()).unwrap();
+        let b2 = WorkingBlock::new(None, 5, 7, Box::new(b2_data));
+
+        let sequence = Sequence::new(vec![b1, b2]);
+        let data = sequence.concrete_data(&mut context);
+
+        // Should be: "abc" + 2 zeros + "def"
+        assert_eq!(data, b"abc\0\0def");
+    }
+
+    #[test]
+    fn test_sequence_replace() {
+        let mut context = create_test_context();
+
+        let b1_data = MemoryDataSource::from_data(b"abcdefghijk".to_vec()).unwrap();
+        let b1 = WorkingBlock::new(Some(1), 0, 10, Box::new(b1_data));
+
+        let b2_data = MemoryDataSource::from_data(b"lmnopq".to_vec()).unwrap();
+        let b2 = WorkingBlock::new(Some(2), 11, 16, Box::new(b2_data));
+
+        let sequence = Sequence::new(vec![b1, b2]);
+
+        // Replace overlapping parts
+        let new_data = MemoryDataSource::from_data(b"XXX".to_vec()).unwrap();
+        let new_block = WorkingBlock::new(None, 8, 10, Box::new(new_data));
+
+        let replaced = sequence.replace(new_block);
+        assert_eq!(replaced.blocks.len(), 3);
+
+        // First block should be truncated
+        assert_eq!(replaced.blocks[0].first_byte, 0);
+        assert_eq!(replaced.blocks[0].last_byte, 7);
+        assert_eq!(replaced.blocks[0].concrete_data(&mut context), b"abcdefgh");
+
+        // New block
+        assert_eq!(replaced.blocks[1].first_byte, 8);
+        assert_eq!(replaced.blocks[1].last_byte, 10);
+        assert_eq!(replaced.blocks[1].concrete_data(&mut context), b"XXX");
+
+        // Second original block unchanged
+        assert_eq!(replaced.blocks[2].first_byte, 11);
+        assert_eq!(replaced.blocks[2].last_byte, 16);
+        assert_eq!(replaced.blocks[2].concrete_data(&mut context), b"lmnopq");
     }
 }

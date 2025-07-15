@@ -7,10 +7,8 @@ use libc::{S_IFDIR, blksize_t, dev_t, gid_t, mode_t, off_t, size_t, uid_t};
 use r2d2::PooledConnection;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{OptionalExtension, params};
-use std::cell::RefCell;
 use std::io::{Error, ErrorKind, Read, Write};
 use std::path::Path;
-use std::rc::Rc;
 use std::time::Duration;
 
 /// Context passed to each FUSE operation
