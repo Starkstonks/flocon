@@ -8,9 +8,6 @@ pub trait DataSource {
     /// Reads the content from the data source into the provided writer
     fn read_to(&self, context: &mut FloconContext, w: &mut dyn Write) -> io::Result<usize>;
 
-    /// Tells you how big is this data source
-    fn size(&self) -> io::Result<u64>;
-
     /// Performs a slicing of the original data and returns a "view" of a
     /// narrower part of it
     fn slice(&self, offset: u64, size: u64) -> io::Result<Box<dyn DataSource>>;
@@ -73,14 +70,9 @@ impl MemoryDataSource {
 
 impl DataSource for MemoryDataSource {
     /// We're generating our actual slice and feeding it into the writer
-    fn read_to(&self, context: &mut FloconContext, w: &mut dyn Write) -> io::Result<usize> {
+    fn read_to(&self, _context: &mut FloconContext, w: &mut dyn Write) -> io::Result<usize> {
         w.write_all(self.as_slice())?;
         Ok(self.size as usize)
-    }
-
-    /// Unsurprisingly the size is the size
-    fn size(&self) -> io::Result<u64> {
-        Ok(self.size)
     }
 
     /// We're computing a new view of the data based on the slice asked. The
@@ -124,14 +116,10 @@ impl ZeroDataSource {
 }
 
 impl DataSource for ZeroDataSource {
-    fn read_to(&self, context: &mut FloconContext, w: &mut dyn Write) -> io::Result<usize> {
+    fn read_to(&self, _context: &mut FloconContext, w: &mut dyn Write) -> io::Result<usize> {
         let zeros = vec![0u8; self.size as usize];
         w.write_all(&zeros)?;
         Ok(self.size as usize)
-    }
-
-    fn size(&self) -> io::Result<u64> {
-        Ok(self.size)
     }
 
     fn slice(&self, offset: u64, size: u64) -> io::Result<Box<dyn DataSource>> {
@@ -182,10 +170,6 @@ impl DataSource for SqliteDataSource {
 
         blob.seek(io::SeekFrom::Start(self.offset))?;
         io::copy(&mut blob.take(self.size), w).map(|n| n.try_into().unwrap())
-    }
-
-    fn size(&self) -> io::Result<u64> {
-        Ok(self.size)
     }
 
     fn slice(&self, offset: u64, size: u64) -> io::Result<Box<dyn DataSource>> {
@@ -397,6 +381,7 @@ impl Sequence {
 
     /// Returns the concrete data for the entire sequence, filling gaps with
     /// zeros
+    #[allow(dead_code)]
     pub fn concrete_data(&self, context: &mut FloconContext) -> Vec<u8> {
         let mut v = Vec::new();
         self.concrete_data_to_writer(context, &mut v).unwrap();
@@ -475,7 +460,7 @@ mod tests {
         let data = Arc::new(vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
         let source = MemoryDataSource::new(data.clone(), 0, 10).unwrap();
 
-        assert_eq!(source.size().unwrap(), 10);
+        assert_eq!(source.size, 10);
 
         let mut context = create_test_context();
         let mut output = Vec::new();
@@ -492,7 +477,6 @@ mod tests {
 
         // Slice from offset 2, length 5
         let sliced = source.slice(2, 5).unwrap();
-        assert_eq!(sliced.size().unwrap(), 5);
 
         let mut context = create_test_context();
         let mut output = Vec::new();
@@ -519,7 +503,7 @@ mod tests {
     #[test]
     fn test_zero_data_source() {
         let source = ZeroDataSource::new(10);
-        assert_eq!(source.size().unwrap(), 10);
+        assert_eq!(source.size, 10);
 
         let mut context = create_test_context();
         let mut output = Vec::new();
@@ -533,8 +517,6 @@ mod tests {
     fn test_zero_data_source_slice() {
         let source = ZeroDataSource::new(20);
         let sliced = source.slice(5, 10).unwrap();
-
-        assert_eq!(sliced.size().unwrap(), 10);
 
         let mut context = create_test_context();
         let mut output = Vec::new();
@@ -551,7 +533,7 @@ mod tests {
         let block_id = insert_test_block(&mut context, b"0123456789");
 
         let source = SqliteDataSource::new(block_id, 0, 10);
-        assert_eq!(source.size().unwrap(), 10);
+        assert_eq!(source.size, 10);
 
         let mut output = Vec::new();
         let bytes_written = source.read_to(&mut context, &mut output).unwrap();
@@ -570,8 +552,6 @@ mod tests {
 
         let source = SqliteDataSource::new(block_id, 0, 10);
         let sliced = source.slice(3, 4).unwrap();
-
-        assert_eq!(sliced.size().unwrap(), 4);
 
         let mut output = Vec::new();
         sliced.read_to(&mut context, &mut output).unwrap();

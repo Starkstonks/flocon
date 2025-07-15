@@ -55,7 +55,7 @@ impl<'ctx> WinterTree for FloconTree<'ctx> {
 
         match self.ctx.conn.query_row(
             r#"
-            select id, mode, uid, gid, size, rdev, atime, mtime, ctime, btime
+            select id, mode, uid, gid, size, rdev, atime, mtime, ctime
             from inode
             where id = ?
             "#,
@@ -71,7 +71,6 @@ impl<'ctx> WinterTree for FloconTree<'ctx> {
                     atime: parse_datetime(row.get(6)?, 6)?,
                     mtime: parse_datetime(row.get(7)?, 7)?,
                     ctime: parse_datetime(row.get(8)?, 8)?,
-                    btime: parse_datetime(row.get(9)?, 9)?,
                 })
             },
         ) {
@@ -96,7 +95,6 @@ impl<'ctx> WinterTree for FloconTree<'ctx> {
             atime: epoch.into(),
             mtime: epoch.into(),
             ctime: epoch.into(),
-            btime: epoch.into(),
         }
     }
 
@@ -275,7 +273,6 @@ pub struct FloconInode {
     atime: DateTime<Utc>,
     mtime: DateTime<Utc>,
     ctime: DateTime<Utc>,
-    btime: DateTime<Utc>,
 }
 
 impl WinterInode for FloconInode {
@@ -718,7 +715,7 @@ impl WinterHandle for FloconHandle {
     ) -> std::io::Result<size_t> {
         let current_inode_id = self.inode.get_id();
         let write_start = offset;
-        let write_end = (offset + size as off_t - 1);
+        let write_end = offset + size as off_t - 1;
 
         let mut incoming_data = vec![0u8; size];
         let bytes_read = r.read(&mut incoming_data)?;
@@ -1116,7 +1113,7 @@ impl WinterFs for Flocon {
     }
 
     fn create_context(&self) -> Result<Self::Context, Error> {
-        let mut conn = self
+        let conn = self
             .fs_manager
             .get_connection()
             .map_err(|e| Error::new(ErrorKind::Other, e))?;

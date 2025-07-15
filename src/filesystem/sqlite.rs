@@ -5,7 +5,7 @@ use r2d2::{CustomizeConnection, Pool, PooledConnection};
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{Connection, Error, params};
 use rusqlite_migration::{M, Migrations};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use tracing::{debug, info};
 
 fn migrations() -> Migrations<'static> {
@@ -42,7 +42,6 @@ impl CustomizeConnection<Connection, Error> for SqliteConnectionCustomizer {
 
 pub struct FileSystemManager {
     pool: Pool<SqliteConnectionManager>,
-    image_path: PathBuf,
 }
 
 impl FileSystemManager {
@@ -150,10 +149,7 @@ impl FileSystemManager {
     /// and ensures the root inode is present.
     pub fn new(image_path: &Path, mode: u32, uid: u32, gid: u32) -> Result<Self> {
         let pool = Self::setup_pool(image_path)?;
-        let fs = Self {
-            pool,
-            image_path: image_path.to_path_buf(),
-        };
+        let fs = Self { pool };
         fs.init(mode, uid, gid)?;
         Ok(fs)
     }
