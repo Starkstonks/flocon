@@ -1,4 +1,4 @@
-use crate::filesystem::blocks::{Sequence, WorkingBlock};
+use crate::filesystem::blocks::{MemoryDataSource, Sequence, SqliteDataSource, WorkingBlock};
 use crate::filesystem::sqlite::FileSystemManager;
 use crate::filesystem::winter::{WinterFs, WinterInode, WinterTree};
 use crate::filesystem::{EntryCore, WinterHandle};
@@ -7,8 +7,10 @@ use libc::{S_IFDIR, blksize_t, dev_t, gid_t, mode_t, off_t, size_t, uid_t};
 use r2d2::PooledConnection;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{OptionalExtension, params};
+use std::cell::RefCell;
 use std::io::{Error, ErrorKind, Read, Write};
 use std::path::Path;
+use std::rc::Rc;
 use std::time::Duration;
 
 /// Context passed to each FUSE operation
@@ -490,7 +492,7 @@ impl WinterHandle for FloconHandle {
                 .conn
                 .prepare(
                     r#"
-                    select id, inode_id, first_byte, last_byte, data
+                    select id, inode_id, first_byte, last_byte
                     from block
                     where inode_id = ? and first_byte < ? and last_byte >= ?
                     "#,
@@ -501,11 +503,17 @@ impl WinterHandle for FloconHandle {
                 .query_map(
                     params![current_inode_id, truncate_point, truncate_point],
                     |row| {
+                        let id: u64 = row.get(0)?;
+                        let first_byte: u64 = row.get(2)?;
+                        let last_byte: u64 = row.get(3)?;
+                        let size: u64 = last_byte - first_byte + 1;
+                        let source = Box::new(SqliteDataSource::new(id, 0, size));
+
                         Ok(WorkingBlock {
-                            id: Some(row.get(0)?),
-                            first_byte: row.get(2)?,
-                            last_byte: row.get(3)?,
-                            data: row.get(4)?,
+                            id: Some(id),
+                            first_byte,
+                            last_byte,
+                            source,
                         })
                     },
                 )
@@ -513,11 +521,15 @@ impl WinterHandle for FloconHandle {
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| Error::new(ErrorKind::Other, e))?;
 
+            drop(stmt);
+
             // Trim blocks that span the truncation point
             for spanning_block in spanning_blocks {
                 if let Ok(trimmed) =
                     spanning_block.clip(spanning_block.first_byte, (truncate_point - 1) as u64)
                 {
+                    let concrete_data = trimmed.concrete_data(context);
+
                     // Delete the old block
                     context
                         .conn
@@ -527,7 +539,6 @@ impl WinterHandle for FloconHandle {
                         )
                         .map_err(|e| Error::new(ErrorKind::Other, e))?;
 
-                    // Insert the trimmed block
                     context
                         .conn
                         .execute(
@@ -539,7 +550,7 @@ impl WinterHandle for FloconHandle {
                                 current_inode_id,
                                 trimmed.first_byte,
                                 trimmed.last_byte,
-                                &trimmed.data
+                                &concrete_data
                             ],
                         )
                         .map_err(|e| Error::new(ErrorKind::Other, e))?;
@@ -652,33 +663,40 @@ impl WinterHandle for FloconHandle {
             return Ok(0);
         }
 
-        let mut stmt = context
-            .conn
-            .prepare(
-                r#"
-                select id, first_byte, last_byte, data
-                from block
-                where inode_id = ? and last_byte >= ? and first_byte <= ?
-                order by first_byte asc
-                "#,
-            )
-            .map_err(|e| Error::new(ErrorKind::Other, e))?;
+        let working_blocks = {
+            let mut stmt = context
+                .conn
+                .prepare(
+                    r#"
+                    select id, first_byte, last_byte
+                    from block
+                    where inode_id = ? and last_byte >= ? and first_byte <= ?
+                    order by first_byte asc
+                    "#,
+                )
+                .map_err(|e| Error::new(ErrorKind::Other, e))?;
 
-        let working_blocks: Vec<WorkingBlock> = stmt
-            .query_map(params![current_inode_id, read_start, read_end], |row| {
+            stmt.query_map(params![current_inode_id, read_start, read_end], |row| {
+                let id: u64 = row.get(0)?;
+                let first_byte: u64 = row.get(1)?;
+                let last_byte: u64 = row.get(2)?;
+                let size: u64 = last_byte - first_byte + 1;
+                let source = Box::new(SqliteDataSource::new(id, 0, size));
+
                 Ok(WorkingBlock {
-                    id: Some(row.get(0)?),
-                    first_byte: row.get(1)?,
-                    last_byte: row.get(2)?,
-                    data: row.get(3)?,
+                    id: Some(id),
+                    first_byte,
+                    last_byte,
+                    source,
                 })
             })
             .map_err(|e| Error::new(ErrorKind::Other, e))?
             .collect::<Result<Vec<WorkingBlock>, _>>()
-            .map_err(|e| Error::new(ErrorKind::Other, e))?;
+            .map_err(|e| Error::new(ErrorKind::Other, e))?
+        };
 
         let sequence = Sequence::new(working_blocks).clip(read_start as u64, read_end as u64);
-        sequence.concrete_data_to_writer(w)
+        sequence.concrete_data_to_writer(context, w)
     }
 
     /// We're writing the data following that logic:
@@ -714,7 +732,7 @@ impl WinterHandle for FloconHandle {
             .conn
             .prepare(
                 r#"
-                select id, first_byte, last_byte, data
+                select id, first_byte, last_byte
                 from block
                 where inode_id = ? and last_byte >= ? and first_byte <= ?
                 order by first_byte asc
@@ -724,11 +742,17 @@ impl WinterHandle for FloconHandle {
 
         let working_blocks: Vec<WorkingBlock> = stmt
             .query_map(params![current_inode_id, write_start, write_end], |row| {
+                let id: u64 = row.get(0)?;
+                let first_byte: u64 = row.get(1)?;
+                let last_byte: u64 = row.get(2)?;
+                let size: u64 = last_byte - first_byte + 1;
+                let source = Box::new(SqliteDataSource::new(id, 0, size));
+
                 Ok(WorkingBlock {
-                    id: Some(row.get(0)?),
-                    first_byte: row.get(1)?,
-                    last_byte: row.get(2)?,
-                    data: row.get(3)?,
+                    id: Some(id),
+                    first_byte,
+                    last_byte,
+                    source,
                 })
             })
             .map_err(|e| Error::new(ErrorKind::Other, e))?
@@ -738,32 +762,51 @@ impl WinterHandle for FloconHandle {
         let original_block_ids: std::collections::HashSet<u64> =
             working_blocks.iter().filter_map(|b| b.id).collect();
 
+        drop(stmt);
+
         let mut sequence = Sequence::new(working_blocks);
 
         let mut current_offset = write_start;
         for chunk in incoming_data.chunks(self.block_size as usize) {
             let chunk_end = current_offset as u64 + chunk.len() as u64 - 1;
-            let new_block =
-                WorkingBlock::new(None, current_offset as u64, chunk_end, Some(chunk.to_vec()));
+            let new_block = WorkingBlock::new(
+                None,
+                current_offset as u64,
+                chunk_end,
+                Box::new(MemoryDataSource::from_data(chunk.to_vec())?),
+            );
             sequence = sequence.replace(new_block);
             current_offset = (chunk_end + 1) as off_t;
         }
 
-        for blk in &sequence.blocks {
-            if let Some(_id) = blk.id {
-                // This block didn't change, so we don't do anything
-            } else {
-                context
-                    .conn
-                    .execute(
-                        r#"
-                        insert into block (inode_id, first_byte, last_byte, data)
-                        values (?, ?, ?, ?)
-                        "#,
-                        params![current_inode_id, blk.first_byte, blk.last_byte, &blk.data],
-                    )
-                    .map_err(|e| Error::new(ErrorKind::Other, e))?;
-            }
+        let new_blocks_params: Vec<_> = sequence
+            .blocks
+            .iter()
+            .filter_map(|blk| {
+                if blk.id.is_none() {
+                    Some((
+                        current_inode_id,
+                        blk.first_byte,
+                        blk.last_byte,
+                        blk.concrete_data(context),
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for (inode_id, first_byte, last_byte, data) in new_blocks_params {
+            context
+                .conn
+                .execute(
+                    r#"
+                    insert into block (inode_id, first_byte, last_byte, data)
+                    values (?, ?, ?, ?)
+                    "#,
+                    params![inode_id, first_byte, last_byte, data],
+                )
+                .map_err(|e| Error::new(ErrorKind::Other, e))?;
         }
 
         let remaining_block_ids: std::collections::HashSet<u64> =
@@ -849,13 +892,28 @@ impl WinterHandle for FloconHandle {
                 id: None,
                 first_byte: current_offset as u64,
                 last_byte: chunk_end as u64,
-                data: Some(chunk.to_vec()),
+                source: Box::new(
+                    MemoryDataSource::from_data(chunk.to_vec())
+                        .expect("Failed to create MemoryDataSource"),
+                ),
             });
             current_offset = chunk_end + 1;
         }
 
         // Insert all new blocks
         if !working_blocks.is_empty() {
+            let params_list: Vec<_> = working_blocks
+                .iter()
+                .map(|wb| {
+                    (
+                        current_inode_id,
+                        wb.first_byte,
+                        wb.last_byte,
+                        wb.concrete_data(context),
+                    )
+                })
+                .collect();
+
             let mut stmt = context
                 .conn
                 .prepare(
@@ -866,14 +924,9 @@ impl WinterHandle for FloconHandle {
                 )
                 .map_err(|e| Error::new(ErrorKind::Other, e))?;
 
-            for wb in &working_blocks {
-                stmt.execute(params![
-                    current_inode_id,
-                    wb.first_byte,
-                    wb.last_byte,
-                    &wb.data
-                ])
-                .map_err(|e| Error::new(ErrorKind::Other, e))?;
+            for (inode_id, first_byte, last_byte, data) in params_list {
+                stmt.execute(params![inode_id, first_byte, last_byte, data])
+                    .map_err(|e| Error::new(ErrorKind::Other, e))?;
             }
         }
 

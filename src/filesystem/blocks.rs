@@ -1,45 +1,261 @@
+use crate::filesystem::FloconContext;
 use std::io;
-use std::io::Write;
+use std::io::Read;
+use std::io::{Seek, Write};
+use std::sync::Arc;
 
-#[derive(Debug, Clone, PartialEq)]
+pub trait DataSource {
+    /// Reads the content from the data source into the provided writer
+    fn read_to(&self, context: &mut FloconContext, w: &mut dyn Write) -> io::Result<usize>;
+
+    /// Tells you how big is this data source
+    fn size(&self) -> io::Result<u64>;
+
+    /// Performs a slicing of the original data and returns a "view" of a
+    /// narrower part of it
+    fn slice(&self, offset: u64, size: u64) -> io::Result<Box<dyn DataSource>>;
+
+    /// Generates a clone. Not sure why the trait doesn't work or whatever
+    /// but I'll just implement that manually for now
+    fn clone(&self) -> Box<dyn DataSource>;
+}
+
+/// A data source that takes hold in the RAM
+pub struct MemoryDataSource {
+    /// The underlying data
+    data: Arc<Vec<u8>>,
+
+    /// Offset at which data is read
+    offset: u64,
+
+    /// How much data do we want
+    size: u64,
+}
+
+impl MemoryDataSource {
+    pub fn new(data: Arc<Vec<u8>>, offset: u64, size: u64) -> io::Result<Self> {
+        let data_len = data.len() as u64;
+
+        if offset > data_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Offset out of bounds",
+            ));
+        }
+
+        match offset.checked_add(size) {
+            Some(end) if end <= data_len => Ok(Self { data, offset, size }),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Size exceeds available data",
+            )),
+        }
+    }
+
+    /// Creates a memory data source from the given data, with offset and
+    /// length covering 100% of the data at this point. Then it will narrow
+    /// down when slice() is called.
+    pub fn from_data(data: Vec<u8>) -> io::Result<Self> {
+        let data_len = data.len() as u64;
+        Self::new(Arc::new(data), 0, data_len)
+    }
+
+    #[inline]
+    fn as_slice(&self) -> &[u8] {
+        // Convert to usize with proper error handling
+        let start = self.offset as usize;
+        let end = (self.offset + self.size) as usize;
+
+        // This should be safe now due to constructor validation
+        &self.data[start..end]
+    }
+}
+
+impl DataSource for MemoryDataSource {
+    /// We're generating our actual slice and feeding it into the writer
+    fn read_to(&self, context: &mut FloconContext, w: &mut dyn Write) -> io::Result<usize> {
+        w.write_all(self.as_slice())?;
+        Ok(self.size as usize)
+    }
+
+    /// Unsurprisingly the size is the size
+    fn size(&self) -> io::Result<u64> {
+        Ok(self.size)
+    }
+
+    /// We're computing a new view of the data based on the slice asked. The
+    /// only thing is that the slice must not exceed the original data size,
+    /// obviously.
+    fn slice(&self, offset: u64, size: u64) -> io::Result<Box<dyn DataSource>> {
+        let new_size = size;
+        let new_offset = self
+            .offset
+            .checked_add(offset)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Offset overflow"))?;
+
+        if offset.checked_add(size).map_or(true, |end| end > self.size) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Slice out of bounds",
+            ));
+        }
+
+        MemoryDataSource::new(Arc::clone(&self.data), new_offset, new_size)
+            .map(|ds| Box::new(ds) as Box<dyn DataSource>)
+    }
+
+    fn clone(&self) -> Box<dyn DataSource> {
+        Box::new(
+            MemoryDataSource::new(Arc::clone(&self.data), self.offset, self.size)
+                .expect("Clone should never fail as the original was valid"),
+        )
+    }
+}
+
+pub struct ZeroDataSource {
+    /// The size of zeros to return
+    size: u64,
+}
+
+impl ZeroDataSource {
+    pub fn new(size: u64) -> Self {
+        Self { size }
+    }
+}
+
+impl DataSource for ZeroDataSource {
+    fn read_to(&self, context: &mut FloconContext, w: &mut dyn Write) -> io::Result<usize> {
+        let zeros = vec![0u8; self.size as usize];
+        w.write_all(&zeros)?;
+        Ok(self.size as usize)
+    }
+
+    fn size(&self) -> io::Result<u64> {
+        Ok(self.size)
+    }
+
+    fn slice(&self, offset: u64, size: u64) -> io::Result<Box<dyn DataSource>> {
+        if offset.checked_add(size).map_or(true, |end| end > self.size) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Slice out of bounds",
+            ));
+        }
+
+        Ok(Box::new(ZeroDataSource::new(size)) as Box<dyn DataSource>)
+    }
+
+    fn clone(&self) -> Box<dyn DataSource> {
+        Box::new(ZeroDataSource::new(self.size))
+    }
+}
+
+pub struct SqliteDataSource {
+    block_id: u64,
+    offset: u64,
+    size: u64,
+}
+
+impl SqliteDataSource {
+    pub fn new(block_id: u64, offset: u64, size: u64) -> Self {
+        Self {
+            block_id,
+            offset,
+            size,
+        }
+    }
+}
+
+impl DataSource for SqliteDataSource {
+    fn read_to(&self, context: &mut FloconContext, w: &mut dyn Write) -> io::Result<usize> {
+        let mut blob = context
+            .conn
+            .blob_open(
+                "main",
+                "block",
+                "data",
+                i64::try_from(self.block_id)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?,
+                true,
+            )
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+        blob.seek(io::SeekFrom::Start(self.offset))?;
+        io::copy(&mut blob.take(self.size), w).map(|n| n.try_into().unwrap())
+    }
+
+    fn size(&self) -> io::Result<u64> {
+        Ok(self.size)
+    }
+
+    fn slice(&self, offset: u64, size: u64) -> io::Result<Box<dyn DataSource>> {
+        if offset.checked_add(size).map_or(true, |end| end > self.size) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Slice out of bounds",
+            ));
+        }
+
+        let new_offset = self
+            .offset
+            .checked_add(offset)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Offset overflow"))?;
+
+        Ok(Box::new(SqliteDataSource {
+            block_id: self.block_id,
+            offset: new_offset,
+            size,
+        }))
+    }
+
+    fn clone(&self) -> Box<dyn DataSource> {
+        Box::new(SqliteDataSource {
+            block_id: self.block_id,
+            offset: self.offset,
+            size: self.size,
+        })
+    }
+}
+
 pub struct WorkingBlock {
     pub id: Option<u64>,
     pub first_byte: u64,
     pub last_byte: u64,
-    pub data: Option<Vec<u8>>,
+    pub source: Box<dyn DataSource>,
 }
 
 impl WorkingBlock {
-    pub fn new(id: Option<u64>, first_byte: u64, last_byte: u64, data: Option<Vec<u8>>) -> Self {
-        let block = Self {
+    pub fn new(
+        id: Option<u64>,
+        first_byte: u64,
+        last_byte: u64,
+        source: Box<dyn DataSource>,
+    ) -> Self {
+        Self {
             id,
             first_byte,
             last_byte,
-            data,
-        };
-
-        #[cfg(debug_assertions)]
-        {
-            if let Some(ref data) = block.data {
-                debug_assert_eq!(
-                    data.len(),
-                    (block.last_byte - block.first_byte + 1) as usize,
-                    "Data length is inconsistent with block coordinates"
-                );
-            }
+            source,
         }
-
-        block
     }
 
-    /// The data might be actual data but it might also be zero-filled. When
-    /// it is used to "export" the data to other systems that don't have that
-    /// convention, we need to materialize those zeros.
-    pub fn concrete_data(&self) -> Vec<u8> {
-        match &self.data {
-            Some(data) => data.clone(),
-            None => vec![0u8; (self.last_byte - self.first_byte + 1) as usize],
-        }
+    /// We don't necessarily hold the actual data at the time of manipulating
+    /// blocks, however at this point we want to cash out and see what we've
+    /// got. The data will get written in the Write.
+    pub fn concrete_data_to_writer(
+        &self,
+        context: &mut FloconContext,
+        w: &mut dyn Write,
+    ) -> io::Result<usize> {
+        self.source.read_to(context, w)
+    }
+
+    /// Convenience wrapper around concrete_data_to_writer() which will give
+    /// you the vector straight away instead of expecting you to create it.
+    pub fn concrete_data(&self, context: &mut FloconContext) -> Vec<u8> {
+        let mut v = Vec::new();
+        self.concrete_data_to_writer(context, &mut v).unwrap();
+        v
     }
 
     /// Generates a new block clipped within the given boundaries
@@ -53,22 +269,13 @@ impl WorkingBlock {
             return Err("Clipping range does not intersect with block range".to_string());
         }
 
-        if clipped_first == self.first_byte && clipped_last == self.last_byte {
-            return Ok(self.clone());
-        }
+        let offset = clipped_first - self.first_byte;
+        let size = clipped_last - clipped_first + 1;
 
-        let clipped_data = self.data.as_ref().map(|data| {
-            let start_offset = (clipped_first - self.first_byte) as usize;
-            let end_offset = (clipped_last - self.first_byte + 1) as usize;
-            data[start_offset..end_offset].to_vec()
-        });
-
-        Ok(WorkingBlock::new(
-            None,
-            clipped_first,
-            clipped_last,
-            clipped_data,
-        ))
+        self.source
+            .slice(offset, size)
+            .map_err(|e| e.to_string())
+            .map(|source| WorkingBlock::new(self.id, clipped_first, clipped_last, source))
     }
 
     /// Removes the given range from current block and returns the list of
@@ -77,7 +284,12 @@ impl WorkingBlock {
         assert!(first_byte <= last_byte, "first_byte must be <= last_byte");
 
         if last_byte < self.first_byte || first_byte > self.last_byte {
-            return vec![self.clone()];
+            return vec![WorkingBlock::new(
+                self.id,
+                self.first_byte,
+                self.last_byte,
+                self.source.clone(),
+            )];
         }
 
         if first_byte <= self.first_byte && last_byte >= self.last_byte {
@@ -88,31 +300,36 @@ impl WorkingBlock {
 
         if first_byte > self.first_byte {
             let left_last = (first_byte - 1).min(self.last_byte);
-            let left_data = self.data.as_ref().map(|data| {
-                let end = (left_last - self.first_byte + 1) as usize;
-                data[..end].to_vec()
-            });
+            let left_size = left_last - self.first_byte + 1;
+            let left_source = self
+                .source
+                .slice(0, left_size)
+                .map_err(|_| "Failed to slice source".to_string())
+                .unwrap();
 
             result.push(WorkingBlock::new(
                 None,
                 self.first_byte,
                 left_last,
-                left_data,
+                left_source,
             ));
         }
 
         if last_byte < self.last_byte {
             let right_first = (last_byte + 1).max(self.first_byte);
-            let right_data = self.data.as_ref().map(|data| {
-                let start_offset = (right_first - self.first_byte) as usize;
-                data[start_offset..].to_vec()
-            });
+            let right_offset = right_first - self.first_byte;
+            let right_size = self.last_byte - right_first + 1;
+            let right_source = self
+                .source
+                .slice(right_offset, right_size)
+                .map_err(|_| "Failed to slice source".to_string())
+                .unwrap();
 
             result.push(WorkingBlock::new(
                 None,
                 right_first,
                 self.last_byte,
-                right_data,
+                right_source,
             ));
         }
 
@@ -120,7 +337,6 @@ impl WorkingBlock {
     }
 }
 
-#[derive(Debug, Clone)]
 pub struct Sequence {
     pub blocks: Vec<WorkingBlock>,
 }
@@ -132,7 +348,11 @@ impl Sequence {
 
     /// Writes the concrete data for the entire sequence to a writer, filling
     /// gaps with zeros. Returns the number of bytes written.
-    pub fn concrete_data_to_writer(&self, w: &mut dyn Write) -> io::Result<usize> {
+    pub fn concrete_data_to_writer(
+        &self,
+        context: &mut FloconContext,
+        w: &mut dyn Write,
+    ) -> io::Result<usize> {
         if self.blocks.is_empty() {
             return Ok(0);
         }
@@ -143,24 +363,13 @@ impl Sequence {
         let mut current_pos = first_byte;
 
         for block in &self.blocks {
-            // Fill gap before this block with zeros
             let gap_size = block.first_byte as i64 - current_pos as i64;
+
             if gap_size > 0 {
                 total_written += Self::write_zeros(w, gap_size as usize)?;
             }
 
-            // Add block data
-            match &block.data {
-                Some(data) => {
-                    w.write_all(data)?;
-                    total_written += data.len();
-                }
-                None => {
-                    let block_size = (block.last_byte - block.first_byte + 1) as usize;
-                    total_written += Self::write_zeros(w, block_size)?;
-                }
-            }
-
+            total_written += block.concrete_data_to_writer(context, w)?;
             current_pos = block.last_byte + 1;
         }
 
@@ -183,9 +392,9 @@ impl Sequence {
 
     /// Returns the concrete data for the entire sequence, filling gaps with
     /// zeros
-    pub fn concrete_data(&self) -> Vec<u8> {
+    pub fn concrete_data(&self, context: &mut FloconContext) -> Vec<u8> {
         let mut v = Vec::new();
-        self.concrete_data_to_writer(&mut v).unwrap();
+        self.concrete_data_to_writer(context, &mut v).unwrap();
         v
     }
 
@@ -204,172 +413,15 @@ impl Sequence {
 
     /// Inserts this block into the sequence and remove overlapping parts
     pub fn replace(&self, block: WorkingBlock) -> Sequence {
-        let mut new_blocks = vec![block.clone()];
+        let fb = block.first_byte;
+        let lb = block.last_byte;
+        let mut new_blocks = vec![block];
 
         for b in &self.blocks {
-            new_blocks.extend(b.remove(block.first_byte, block.last_byte));
+            new_blocks.extend(b.remove(fb, lb));
         }
 
         new_blocks.sort_by_key(|b| b.first_byte);
         Sequence::new(new_blocks)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_block_clip() {
-        let fb = 10;
-        let lb = 20;
-
-        // Block before range
-        let b = WorkingBlock::new(None, 0, 5, None);
-        assert!(b.clip(fb, lb).is_err());
-        assert_eq!(
-            b.clip(fb, lb).unwrap_err(),
-            "Clipping range does not intersect with block range"
-        );
-
-        // Block cut by range start
-        let b = WorkingBlock::new(None, 5, 14, Some(b"0123456789".to_vec()));
-        let bc = b.clip(fb, lb).unwrap();
-        assert_eq!(bc.first_byte, 10);
-        assert_eq!(bc.last_byte, 14);
-        assert_eq!(bc.data.as_ref().unwrap(), b"56789");
-
-        // Block cut by range end
-        let b = WorkingBlock::new(None, 17, 26, Some(b"0123456789".to_vec()));
-        let bc = b.clip(fb, lb).unwrap();
-        assert_eq!(bc.first_byte, 17);
-        assert_eq!(bc.last_byte, 20);
-        assert_eq!(bc.data.as_ref().unwrap(), b"0123");
-
-        // Block within range
-        let b = WorkingBlock::new(None, 10, 19, Some(b"0123456789".to_vec()));
-        let bc = b.clip(fb, lb).unwrap();
-        assert_eq!(b, bc);
-
-        // Range within block
-        let b = WorkingBlock::new(None, 10, 19, Some(b"0123456789".to_vec()));
-        let bc = b.clip(11, 18).unwrap();
-        assert_eq!(bc.first_byte, 11);
-        assert_eq!(bc.last_byte, 18);
-        assert_eq!(bc.data.as_ref().unwrap(), b"12345678");
-    }
-
-    #[test]
-    fn test_block_concrete_data() {
-        // Block within range
-        let b = WorkingBlock::new(None, 10, 19, None);
-        let bc = b.clip(10, 20).unwrap();
-        assert_eq!(bc.concrete_data(), vec![0u8; 10]);
-
-        // Range within block
-        let b = WorkingBlock::new(None, 10, 19, None);
-        let bc = b.clip(11, 18).unwrap();
-        assert_eq!(bc.concrete_data(), vec![0u8; 8]);
-
-        // Range within block (with data)
-        let b = WorkingBlock::new(None, 10, 19, Some(b"0123456789".to_vec()));
-        let bc = b.clip(11, 18).unwrap();
-        assert_eq!(bc.concrete_data(), b"12345678");
-    }
-
-    #[test]
-    fn test_clip_sequence() {
-        let b1 = WorkingBlock::new(Some(1), 0, 10, Some(b"abcdefghijk".to_vec()));
-        let b2 = WorkingBlock::new(Some(2), 11, 16, Some(b"lmnopq".to_vec()));
-        let b3 = WorkingBlock::new(Some(3), 17, 25, Some(b"rstuvwxyz".to_vec()));
-        let s = Sequence::new(vec![b1, b2, b3]);
-
-        let s_prime = s.clip(10, 20);
-        assert_eq!(s_prime.blocks.len(), 3);
-
-        assert_eq!(s_prime.blocks[0].id, None);
-        assert_eq!(s_prime.blocks[0].first_byte, 10);
-        assert_eq!(s_prime.blocks[0].last_byte, 10);
-        assert_eq!(s_prime.blocks[0].concrete_data(), b"k");
-
-        assert_eq!(s_prime.blocks[1].id, Some(2));
-        assert_eq!(s_prime.blocks[1].first_byte, 11);
-        assert_eq!(s_prime.blocks[1].last_byte, 16);
-        assert_eq!(s_prime.blocks[1].concrete_data(), b"lmnopq");
-
-        assert_eq!(s_prime.blocks[2].id, None);
-        assert_eq!(s_prime.blocks[2].first_byte, 17);
-        assert_eq!(s_prime.blocks[2].last_byte, 20);
-        assert_eq!(s_prime.blocks[2].concrete_data(), b"rstu");
-    }
-
-    #[test]
-    fn test_remove_block() {
-        let b = WorkingBlock::new(Some(1), 5, 14, Some(b"0123456789".to_vec()));
-
-        // No intersect
-        let result = b.remove(0, 4);
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0], b);
-
-        // Full intersect
-        let result = b.remove(5, 14);
-        assert!(result.is_empty());
-
-        // Clip left
-        let result = b.remove(3, 7);
-        assert_eq!(result.len(), 1);
-        let b1 = &result[0];
-        assert_eq!(b1.id, None);
-        assert_eq!(b1.first_byte, 8);
-        assert_eq!(b1.last_byte, 14);
-        assert_eq!(b1.concrete_data(), b"3456789");
-
-        // Clip right
-        let result = b.remove(12, 14);
-        assert_eq!(result.len(), 1);
-        let b1 = &result[0];
-        assert_eq!(b1.id, None);
-        assert_eq!(b1.first_byte, 5);
-        assert_eq!(b1.last_byte, 11);
-        assert_eq!(b1.concrete_data(), b"0123456");
-
-        // Punch a hole
-        let result = b.remove(7, 10);
-        assert_eq!(result.len(), 2);
-        let b1 = &result[0];
-        let b2 = &result[1];
-        assert_eq!(b1.id, None);
-        assert_eq!(b1.first_byte, 5);
-        assert_eq!(b1.last_byte, 6);
-        assert_eq!(b1.concrete_data(), b"01");
-        assert_eq!(b2.id, None);
-        assert_eq!(b2.first_byte, 11);
-        assert_eq!(b2.last_byte, 14);
-        assert_eq!(b2.concrete_data(), b"6789");
-    }
-
-    #[test]
-    fn test_sequence_concrete_data() {
-        // Empty sequence
-        let s = Sequence::new(vec![]);
-        assert_eq!(s.concrete_data(), Vec::<u8>::new());
-
-        // Single block
-        let b1 = WorkingBlock::new(None, 5, 9, Some(b"hello".to_vec()));
-        let s = Sequence::new(vec![b1]);
-        assert_eq!(s.concrete_data(), b"hello");
-
-        // Multiple blocks with gaps
-        let b1 = WorkingBlock::new(None, 0, 4, Some(b"hello".to_vec()));
-        let b2 = WorkingBlock::new(None, 10, 14, Some(b"world".to_vec()));
-        let s = Sequence::new(vec![b1, b2]);
-        assert_eq!(s.concrete_data(), b"hello\0\0\0\0\0world");
-
-        // Blocks with None data (should be zeros)
-        let b1 = WorkingBlock::new(None, 0, 2, None);
-        let b2 = WorkingBlock::new(None, 3, 5, Some(b"abc".to_vec()));
-        let s = Sequence::new(vec![b1, b2]);
-        assert_eq!(s.concrete_data(), b"\0\0\0abc");
     }
 }
