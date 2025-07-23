@@ -2,6 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use fuse_backend_rs::api::server::Server;
 use fuse_backend_rs::transport::FuseSession;
+use nix::mount::MsFlags;
 use std::sync::Arc;
 use std::sync::mpsc::channel;
 use std::{num::ParseIntError, path::PathBuf, thread};
@@ -171,6 +172,7 @@ fn flocon_mount(
         "flocon",
         false,
     )?;
+    session.set_mount_flags(MsFlags::MS_NOATIME);
     session.mount()?;
 
     let (tx, rx) = channel();
