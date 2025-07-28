@@ -6,16 +6,17 @@ use fuse_backend_rs::api::filesystem::{
     ZeroCopyWriter,
 };
 use libc::{
-    O_EXCL, O_TRUNC, RENAME_EXCHANGE, RENAME_NOREPLACE, S_IFDIR, S_IFLNK, S_IFREG, blkcnt64_t,
-    blksize_t, c_ulong, dev_t, gid_t, ino64_t, mode_t, off_t, size_t, stat64, statvfs64, time_t,
-    uid_t,
+    EISDIR, ENOENT, ENOTDIR, ENOTEMPTY, O_EXCL, O_TRUNC, RENAME_EXCHANGE, RENAME_NOREPLACE,
+    S_IFDIR, S_IFLNK, S_IFREG, blkcnt64_t, blksize_t, c_ulong, dev_t, gid_t, ino64_t, mode_t,
+    off_t, size_t, stat64, statvfs64, time_t, uid_t,
 };
 use std::collections::HashMap;
 use std::ffi::CStr;
+use std::io;
 use std::io::{Read, Write};
 use std::mem::zeroed;
 use std::sync::Mutex;
-use std::{io, mem};
+use tracing::{debug, debug_span, info};
 
 pub trait WinterTree {
     type Inode: WinterInode;
@@ -170,6 +171,7 @@ pub trait WinterHandle {
     fn xattr_list(&mut self, context: &mut Self::Context) -> io::Result<Vec<String>>;
 }
 
+#[derive(Debug)]
 struct OwnedDirEntry {
     pub ino: ino64_t,
     pub offset: u64,
@@ -323,20 +325,20 @@ impl<FS: WinterFs> WinterFsHandler<FS> {
 
             if *count == 0 {
                 counts.remove(&inode);
-                tracing::debug!(
+                debug!(
                     "decrease_lookup: inode {} lookup count reached 0, checking link count for deletion",
                     inode
                 );
 
                 let parents = tree.find_parents_of(inode)?;
-                tracing::debug!(
+                debug!(
                     "decrease_lookup: inode {} has {} parent links",
                     inode,
                     parents.len()
                 );
 
                 if parents.is_empty() {
-                    tracing::info!(
+                    info!(
                         "decrease_lookup: deleting inode {} as it has no remaining links or lookups",
                         inode
                     );
@@ -344,7 +346,7 @@ impl<FS: WinterFs> WinterFsHandler<FS> {
                 }
             }
         } else {
-            tracing::debug!(
+            debug!(
                 "decrease_lookup called for inode {} which is not tracked. This is safe to ignore (e.g., after a restart).",
                 inode
             );
@@ -531,6 +533,7 @@ impl<FS: WinterFs> WinterFsHandler<FS> {
     ///   false, it must NOT be a directory
     /// - `check_empty`: if true, checks that the directory is empty (only
     ///   relevant when require_directory is true)
+    #[inline]
     fn remove_entry(
         &self,
         parent: u64,
@@ -544,50 +547,46 @@ impl<FS: WinterFs> WinterFsHandler<FS> {
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Invalid UTF-8"))?;
             let mut tree = self.fs.tree(op_ctx)?;
 
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                debug!(
+                    "unlinking {} '{}' from parent {} (full path: {})",
+                    if require_directory {
+                        "directory"
+                    } else {
+                        "file"
+                    },
+                    name_str,
+                    parent,
+                    self.build_full_path(parent, &name_str, &mut tree)
+                        .unwrap_or_else(|_| format!("<unknown>/{}", name_str))
+                );
+            }
+
             let parent_inode = tree.get_inode(parent)?;
 
             if parent_inode.get_mode() & S_IFDIR == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotADirectory,
-                    "Parent is not a directory",
-                ));
+                return Err(io::Error::from_raw_os_error(ENOTDIR));
             }
 
             let child_id = tree.lookup(parent, name_str)?;
 
             if child_id == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    if require_directory {
-                        "Directory not found"
-                    } else {
-                        "File not found"
-                    },
-                ));
+                return Err(io::Error::from_raw_os_error(ENOENT));
             }
 
             let child = tree.get_inode(child_id)?;
             let is_directory = child.get_mode() & S_IFDIR != 0;
 
             if require_directory && !is_directory {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotADirectory,
-                    "Not a directory",
-                ));
+                return Err(io::Error::from_raw_os_error(ENOTDIR));
             } else if !require_directory && is_directory {
-                return Err(io::Error::new(
-                    io::ErrorKind::IsADirectory,
-                    "Is a directory",
-                ));
+                return Err(io::Error::from_raw_os_error(EISDIR));
             }
 
             if check_empty && is_directory {
                 let children = tree.find_children_of(child_id, 1, 0)?;
                 if !children.is_empty() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::DirectoryNotEmpty,
-                        "Directory not empty",
-                    ));
+                    return Err(io::Error::from_raw_os_error(ENOTEMPTY));
                 }
             }
 
@@ -605,93 +604,145 @@ impl<FS: WinterFs> WinterFsHandler<FS> {
         size: u32,
         offset: u64,
     ) -> io::Result<Vec<(OwnedDirEntry, Entry)>> {
-        self.with_context(|op_ctx| {
+        self.with_context_and_handle(inode, Some(handle), 0, |op_ctx, handle| {
             let mut tree = self.fs.tree(op_ctx)?;
-
-            let dir_id = if handle != 0 {
-                self.with_handle(handle, |fh| fh.get_inode().get_id())?
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid handle"))?
-            } else {
-                inode
-            };
-
-            let dir_inode = tree.get_inode(dir_id)?;
-
-            if dir_inode.get_mode() & S_IFDIR == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotADirectory,
-                    "Not a directory",
-                ));
-            }
-
             let mut entries = Vec::new();
-            let mut current_offset = 1u64;
+
+            let dir = handle.get_inode();
+
+            if dir.get_mode() & S_IFDIR == 0 {
+                return Err(io::Error::from_raw_os_error(ENOTDIR));
+            }
 
             if offset == 0 && size > 0 {
                 let dot_entry = OwnedDirEntry {
-                    ino: dir_id as ino64_t,
-                    offset: current_offset,
+                    ino: dir.get_id(),
+                    offset: entries.len() as u64 + offset + 1,
                     type_: libc::DT_DIR.into(),
                     name: b".".to_vec(),
                 };
-                let dot_inode = tree.get_inode(dir_id)?;
-                let dot_entry_data = self.make_entry(&dot_inode, &mut tree)?;
+                let dot_entry_data = self.make_entry(&dir, &mut tree)?;
                 entries.push((dot_entry, dot_entry_data));
-                current_offset += 1;
-
-                if entries.len() < size as usize {
-                    let parent_ids = tree.find_parents_of(dir_id)?;
-                    let parent_id = parent_ids.first().copied().unwrap_or(dir_id);
-
-                    let dotdot_entry = OwnedDirEntry {
-                        ino: parent_id as ino64_t,
-                        offset: current_offset,
-                        type_: libc::DT_DIR.into(),
-                        name: b"..".to_vec(),
-                    };
-                    let parent_inode = tree.get_inode(parent_id)?;
-                    let dotdot_entry_data = self.make_entry(&parent_inode, &mut tree)?;
-                    entries.push((dotdot_entry, dotdot_entry_data));
-                    current_offset += 1;
-                }
             }
 
-            let regular_offset = if offset <= 2 {
-                0
-            } else {
-                (offset - 2) as usize
-            };
+            if offset <= 1 && (offset + size as u64) > 1 {
+                let parent = if dir.get_id() == 1 {
+                    dir.get_id()
+                } else {
+                    tree.find_parents_of(dir.get_id())?
+                        .first()
+                        .copied()
+                        .unwrap()
+                };
 
-            let remaining_size = (size as usize).saturating_sub(entries.len());
+                let dd_entry = OwnedDirEntry {
+                    ino: parent,
+                    offset: entries.len() as u64 + offset + 1,
+                    type_: libc::DT_DIR.into(),
+                    name: b"..".to_vec(),
+                };
+                let dd_entry_data = self.make_entry(&tree.get_inode(parent)?, &mut tree)?;
+                entries.push((dd_entry, dd_entry_data));
+            }
 
-            if remaining_size > 0 && offset <= current_offset {
+            let real_offset = 0i64.max(offset as i64 - 2);
+            let real_size = 0i64.max(size as i64 - entries.len() as i64);
+
+            if real_size > 0 {
                 let children: Vec<(String, u64)> = tree
-                    .find_children_of(dir_id, remaining_size, regular_offset)?
+                    .find_children_of(dir.get_id(), real_size as usize, real_offset as usize)?
                     .into_iter()
                     .collect();
 
                 for (name, child_id) in children {
-                    current_offset += 1;
-
                     let child_inode = tree.get_inode(child_id)?;
-                    let child_mode = child_inode.get_mode();
-
-                    let dtype = ((child_mode & libc::S_IFMT) >> 12) as u32;
-
+                    let entry = self.make_entry(&child_inode, &mut tree)?;
+                    let dtype = ((child_inode.get_mode() & libc::S_IFMT) >> 12) as u32;
                     let dir_entry = OwnedDirEntry {
-                        ino: child_id as ino64_t,
-                        offset: current_offset,
+                        ino: child_id,
+                        offset: entries.len() as u64 + offset + 1,
                         type_: dtype,
                         name: name.into_bytes(),
                     };
-
-                    let entry = self.make_entry(&child_inode, &mut tree)?;
                     entries.push((dir_entry, entry));
                 }
             }
 
+            if tracing::enabled!(tracing::Level::INFO) {
+                info!(
+                    "readdir({}): returning {} entries",
+                    self.build_full_path(dir.get_id(), "", &mut tree)?,
+                    entries.len()
+                );
+                debug!(
+                    "entries: {:?}",
+                    entries
+                        .iter()
+                        .map(|e| String::from_utf8(e.0.name.clone())
+                            .unwrap_or_else(|_| String::from("<invalid utf8>")))
+                        .collect::<Vec<_>>()
+                );
+            }
+
             Ok(entries)
         })
+    }
+
+    /// Finds the name of the given inode within the specified dir, if it
+    /// exists. If it does not exist you'll get an error (and if the underlying
+    /// file system fails you'll also get an error, out of simplicity).
+    fn find_name_in_dir(
+        &self,
+        parent: u64,
+        inode: u64,
+        tree: &mut FS::Tree<'_>,
+    ) -> io::Result<String> {
+        const PAGE_SIZE: size_t = 1000;
+        let mut offset: size_t = 0;
+
+        loop {
+            let children = tree.find_children_of(parent, PAGE_SIZE, offset)?;
+
+            if children.is_empty() {
+                return Err(io::Error::new(io::ErrorKind::NotFound, "File not found"));
+            }
+
+            offset += children.len();
+
+            for (name, child_id) in &children {
+                if *child_id == inode {
+                    return Ok(name.clone());
+                }
+            }
+        }
+    }
+
+    /// Builds the full path for a file given its parent directory and name
+    fn build_full_path(
+        &self,
+        parent: u64,
+        name: &str,
+        tree: &mut FS::Tree<'_>,
+    ) -> io::Result<String> {
+        let mut components = Vec::new();
+        components.push(name.to_string());
+
+        let mut current_id = parent;
+
+        loop {
+            let new_parent = tree.find_parents_of(current_id)?.first().copied();
+
+            if let Some(new_parent_id) = new_parent {
+                components.push(self.find_name_in_dir(new_parent_id, current_id, tree)?);
+                current_id = new_parent_id;
+            } else {
+                components.push(String::from(""));
+                break;
+            }
+        }
+
+        components.reverse();
+        Ok(components.join("/"))
     }
 }
 
@@ -704,6 +755,8 @@ where
     type Handle = u64;
 
     fn init(&self, capable: FsOptions) -> io::Result<FsOptions> {
+        let _span = debug_span!("init", ?capable).entered();
+
         let mut wanted = FsOptions::empty();
 
         #[cfg(target_os = "linux")]
@@ -720,10 +773,15 @@ where
         wanted.insert(FsOptions::CACHE_SYMLINKS);
         wanted.insert(FsOptions::POSIX_ACL);
 
-        Ok(capable & wanted)
+        let result = capable & wanted;
+        debug!("filesystem initialized with options: {:?}", result);
+        Ok(result)
     }
 
     fn lookup(&self, _ctx: &Context, parent: Self::Inode, name: &CStr) -> io::Result<Entry> {
+        let name_str = name.to_string_lossy();
+        let _span = debug_span!("lookup", parent, name = %name_str).entered();
+
         self.with_context(|op_ctx| {
             let mut tree = self.fs.tree(op_ctx)?;
             let name_str = name
@@ -732,17 +790,31 @@ where
             let file_id = tree.lookup(parent, name_str)?;
 
             if file_id > 0 {
+                if tracing::enabled!(tracing::Level::DEBUG) {
+                    debug!(
+                        "found inode {} for path '{}'",
+                        file_id,
+                        self.build_full_path(parent, name_str, &mut tree)?
+                    );
+                }
                 let entry = self.make_entry(&tree.get_inode(file_id)?, &mut tree)?;
                 self.increase_lookup(file_id, 1);
                 Ok(entry)
             } else {
+                if tracing::enabled!(tracing::Level::DEBUG) {
+                    debug!(
+                        "no inode found for path '{}'",
+                        self.build_full_path(parent, name_str, &mut tree)?
+                    );
+                }
                 self.make_entry(&tree.empty_inode(), &mut tree)
             }
         })
     }
 
     fn forget(&self, _ctx: &Context, inode: Self::Inode, count: u64) {
-        tracing::debug!("forget called for inode {} with count {}", inode, count);
+        let _span = debug_span!("forget", inode, count).entered();
+        debug!("forget called for inode {} with count {}", inode, count);
 
         let result = self.with_context(|op_ctx| {
             let mut tree = self.fs.tree(op_ctx)?;
@@ -751,7 +823,7 @@ where
 
         match result {
             Ok(()) => {
-                tracing::debug!("forget completed successfully for inode {}", inode);
+                debug!("forget completed successfully for inode {}", inode);
             }
             Err(e) => {
                 tracing::error!(
@@ -765,16 +837,16 @@ where
     }
 
     fn batch_forget(&self, _ctx: &Context, requests: Vec<(Self::Inode, u64)>) {
-        tracing::debug!("batch_forget called with {} requests", requests.len());
+        let _span = debug_span!("batch_forget", count = requests.len()).entered();
+        debug!("batch_forget called with {} requests", requests.len());
 
         let result = self.with_context(|op_ctx| {
             let mut tree = self.fs.tree(op_ctx)?;
 
             for (inode, count) in &requests {
-                tracing::debug!(
+                debug!(
                     "  processing forget for inode {} with count {}",
-                    inode,
-                    count
+                    inode, count
                 );
                 self.decrease_lookup(*inode, *count, &mut tree)?;
             }
@@ -784,7 +856,7 @@ where
 
         match result {
             Ok(()) => {
-                tracing::debug!("batch_forget completed successfully");
+                debug!("batch_forget completed successfully");
             }
             Err(e) => {
                 tracing::error!("batch_forget failed: {:?}", e);
@@ -798,6 +870,8 @@ where
         inode: Self::Inode,
         handle: Option<Self::Handle>,
     ) -> io::Result<(stat64, Duration)> {
+        let _span = debug_span!("getattr", inode, ?handle).entered();
+
         self.with_context(|op_ctx| {
             let mut tree = self.fs.tree(op_ctx)?;
 
@@ -810,6 +884,10 @@ where
 
             let inode_obj = tree.get_inode(inode_id)?;
             let entry = self.make_entry(&inode_obj, &mut tree)?;
+            debug!(
+                "retrieved attributes for inode {}, size={}",
+                inode_id, entry.attr.st_size
+            );
             Ok((entry.attr, entry.attr_timeout))
         })
     }
@@ -822,20 +900,26 @@ where
         handle: Option<Self::Handle>,
         valid: SetattrValid,
     ) -> io::Result<(stat64, Duration)> {
+        let _span = debug_span!("setattr", inode, ?handle, ?valid).entered();
+
         self.with_context_and_handle(inode, handle, 0, |op_ctx, fh| {
             if valid.contains(SetattrValid::MODE) {
+                debug!("setting mode to {:o}", attr.st_mode);
                 fh.set_mode(op_ctx, attr.st_mode)?;
             }
 
             if valid.contains(SetattrValid::UID) {
+                debug!("setting uid to {}", attr.st_uid);
                 fh.set_uid(op_ctx, attr.st_uid)?;
             }
 
             if valid.contains(SetattrValid::GID) {
+                debug!("setting gid to {}", attr.st_gid);
                 fh.set_gid(op_ctx, attr.st_gid)?;
             }
 
             if valid.contains(SetattrValid::SIZE) {
+                debug!("setting size to {}", attr.st_size);
                 fh.set_size(op_ctx, attr.st_size)?;
             }
 
@@ -849,8 +933,10 @@ where
                             format!("Invalid atime: {} {}", attr.st_atime, attr.st_atime_nsec),
                         )
                     })?;
+                debug!("setting atime to {}", atime);
                 fh.set_atime(op_ctx, atime)?;
             } else if valid.contains(SetattrValid::ATIME_NOW) {
+                debug!("setting atime to now");
                 fh.set_atime(op_ctx, Utc::now())?;
             }
 
@@ -864,8 +950,10 @@ where
                             format!("Invalid mtime: {} {}", attr.st_mtime, attr.st_mtime_nsec),
                         )
                     })?;
+                debug!("setting mtime to {}", mtime);
                 fh.set_mtime(op_ctx, mtime)?;
             } else if valid.contains(SetattrValid::MTIME_NOW) {
+                debug!("setting mtime to now");
                 fh.set_mtime(op_ctx, Utc::now())?;
             }
 
@@ -879,6 +967,7 @@ where
                             format!("Invalid ctime: {} {}", attr.st_ctime, attr.st_ctime_nsec),
                         )
                     })?;
+                debug!("setting ctime to {}", ctime);
                 fh.set_ctime(op_ctx, ctime)?;
             }
 
@@ -891,6 +980,8 @@ where
     }
 
     fn readlink(&self, _ctx: &Context, inode: Self::Inode) -> io::Result<Vec<u8>> {
+        let _span = debug_span!("readlink", inode).entered();
+
         self.with_context(|op_ctx| {
             let mut tree = self.fs.tree(op_ctx)?;
             let inode_obj = tree.get_inode(inode)?;
@@ -906,6 +997,7 @@ where
             // Get size before we open the handle
             let core = inode_obj.make_entry()?;
             let size = core.st_size as usize;
+            debug!("reading symlink target of size {}", size);
 
             if size == 0 {
                 return Ok(Vec::new());
@@ -929,13 +1021,11 @@ where
                 ));
             }
 
+            debug!("symlink target: {:?}", String::from_utf8_lossy(&buffer));
             Ok(buffer)
         })
     }
 
-    /// The storage of symlinks happens basically by leveraging the underlying
-    /// storage layer that we have. That's dumb but it works and requires no
-    /// extra work from the FS implementer.
     fn symlink(
         &self,
         ctx: &Context,
@@ -943,6 +1033,11 @@ where
         parent: Self::Inode,
         name: &CStr,
     ) -> io::Result<Entry> {
+        let name_str = name.to_string_lossy();
+        let linkname_str = linkname.to_string_lossy();
+        let _span =
+            debug_span!("symlink", parent, name = %name_str, target = %linkname_str).entered();
+
         self.with_context(|op_ctx| {
             let name_str = name
                 .to_str()
@@ -964,6 +1059,7 @@ where
             let mode = S_IFLNK | 0o777;
             let symlink_inode = tree.create_inode(mode, ctx.uid, ctx.gid, 0)?;
             let symlink_id = symlink_inode.get_id();
+            debug!("created symlink inode {}", symlink_id);
 
             // Add the symlink to the parent directory
             tree.add_child(parent, symlink_id, name_str)?;
@@ -990,6 +1086,10 @@ where
             let symlink_inode = tree.get_inode(symlink_id)?;
             let entry = self.make_entry(&symlink_inode, &mut tree)?;
             self.increase_lookup(symlink_id, 1);
+            debug!(
+                "symlink '{}' -> '{}' created successfully",
+                name_str, linkname_str
+            );
             Ok(entry)
         })
     }
@@ -1003,6 +1103,9 @@ where
         rdev: u32,
         umask: u32,
     ) -> io::Result<Entry> {
+        let name_str = name.to_string_lossy();
+        let _span = debug_span!("mknod", parent, name = %name_str, mode = format!("{:o}", mode), rdev, umask = format!("{:o}", umask)).entered();
+
         self.with_context(|op_ctx| {
             let name_str = name
                 .to_str()
@@ -1021,6 +1124,7 @@ where
             let full_mode = mode & !umask;
             let node = tree.create_inode(full_mode, ctx.uid, ctx.gid, rdev as dev_t)?;
             let node_id = node.get_id();
+            debug!("created node {} with mode {:o}", node_id, full_mode);
 
             tree.add_child(parent, node_id, name_str)?;
 
@@ -1038,6 +1142,9 @@ where
         mode: u32,
         umask: u32,
     ) -> io::Result<Entry> {
+        let name_str = name.to_string_lossy();
+        let _span = debug_span!("mkdir", parent, name = %name_str, mode = format!("{:o}", mode), umask = format!("{:o}", umask)).entered();
+
         self.with_context(|op_ctx| {
             let name_str = name
                 .to_str()
@@ -1054,19 +1161,28 @@ where
 
             let full_mode = S_IFDIR | (mode & !umask);
             let file = tree.create_inode(full_mode, ctx.uid, ctx.gid, 0)?;
-            tree.add_child(parent, file.get_id(), name_str)?;
+            let dir_id = file.get_id();
+            debug!("created directory {} with mode {:o}", dir_id, full_mode);
+
+            tree.add_child(parent, dir_id, name_str)?;
 
             let entry = self.make_entry(&file, &mut tree)?;
-            self.increase_lookup(file.get_id(), 1);
+            self.increase_lookup(dir_id, 1);
             Ok(entry)
         })
     }
 
     fn unlink(&self, _ctx: &Context, parent: Self::Inode, name: &CStr) -> io::Result<()> {
+        let name_str = name.to_string_lossy();
+        let _span = debug_span!("unlink", parent, name = %name_str).entered();
+
         self.remove_entry(parent, name, false, false)
     }
 
     fn rmdir(&self, _ctx: &Context, parent: Self::Inode, name: &CStr) -> io::Result<()> {
+        let name_str = name.to_string_lossy();
+        let _span = debug_span!("rmdir", parent, name = %name_str).entered();
+
         self.remove_entry(parent, name, true, true)
     }
 
@@ -1079,6 +1195,15 @@ where
         newname: &CStr,
         flags: u32,
     ) -> io::Result<()> {
+        let old_name_str = oldname.to_string_lossy();
+        let new_name_str = newname.to_string_lossy();
+        let _span = debug_span!("rename",
+            olddir, oldname = %old_name_str,
+            newdir, newname = %new_name_str,
+            flags = format!("{:#x}", flags)
+        )
+        .entered();
+
         const ALLOWED: [u32; 3] = [0, RENAME_NOREPLACE, RENAME_EXCHANGE];
 
         if !ALLOWED.contains(&flags) {
@@ -1100,6 +1225,18 @@ where
             let mut tree = self.fs.tree(op_ctx)?;
             let old_parent = tree.get_inode(olddir)?;
             let new_parent = tree.get_inode(newdir)?;
+
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                debug!(
+                    "renaming '{}' to '{}' (full paths: '{}' -> '{}')",
+                    old_name_str,
+                    new_name_str,
+                    self.build_full_path(olddir, old_name_str, &mut tree)
+                        .unwrap_or_else(|_| format!("<unknown>/{}", old_name_str)),
+                    self.build_full_path(newdir, new_name_str, &mut tree)
+                        .unwrap_or_else(|_| format!("<unknown>/{}", new_name_str))
+                );
+            }
 
             let source_inode_id = tree.lookup(old_parent.get_id(), old_name_str)?;
 
@@ -1126,12 +1263,14 @@ where
             }
 
             if flags == RENAME_EXCHANGE {
+                debug!("performing rename exchange");
                 tree.remove_child(old_parent.get_id(), old_name_str)?;
                 tree.remove_child(new_parent.get_id(), new_name_str)?;
                 tree.add_child(new_parent.get_id(), source_inode_id, new_name_str)?;
                 tree.add_child(old_parent.get_id(), target_inode_id, old_name_str)?;
             } else {
                 if target_exists {
+                    debug!("removing existing target");
                     tree.remove_child(new_parent.get_id(), new_name_str)?;
                 }
 
@@ -1139,6 +1278,7 @@ where
                 tree.add_child(new_parent.get_id(), source_inode_id, new_name_str)?;
             }
 
+            debug!("rename operation completed successfully");
             Ok(())
         })
     }
@@ -1150,6 +1290,9 @@ where
         newparent: Self::Inode,
         newname: &CStr,
     ) -> io::Result<Entry> {
+        let name_str = newname.to_string_lossy();
+        let _span = debug_span!("link", inode, newparent, newname = %name_str).entered();
+
         self.with_context(|op_ctx| {
             let name_str = newname
                 .to_str()
@@ -1190,6 +1333,7 @@ where
 
             // Add the link
             tree.add_child(newparent, inode, name_str)?;
+            debug!("created hard link '{}' to inode {}", name_str, inode);
 
             // Return the entry for the linked file
             let entry = self.make_entry(&file, &mut tree)?;
@@ -1205,6 +1349,15 @@ where
         name: &CStr,
         args: CreateIn,
     ) -> io::Result<(Entry, Option<Self::Handle>, OpenOptions, Option<u32>)> {
+        let name_str = name.to_string_lossy();
+        let _span = debug_span!("create",
+            parent,
+            name = %name_str,
+            mode = format!("{:o}", args.mode),
+            flags = format!("{:#x}", args.flags)
+        )
+        .entered();
+
         self.with_context(|op_ctx| {
             let name_str = name
                 .to_str()
@@ -1225,10 +1378,21 @@ where
                     let full_mode = S_IFREG | (args.mode & !args.umask);
                     let file = tree.create_inode(full_mode, ctx.uid, ctx.gid, 0)?;
                     let new_id = file.get_id();
+
+                    if tracing::enabled!(tracing::Level::INFO) {
+                        info!(
+                            "Creating file {} (inode {}) with mode {:o}",
+                            self.build_full_path(parent, name_str, &mut tree)?,
+                            new_id,
+                            args.mode
+                        );
+                    }
+
                     tree.add_child(parent, new_id, name_str)?;
                     self.increase_lookup(new_id, 1);
                     new_id
                 } else {
+                    debug!("opening existing file inode {}", existing_id);
                     self.increase_lookup(existing_id, 1);
                     existing_id
                 };
@@ -1242,10 +1406,12 @@ where
             let mut fh = self.fs.open(op_ctx, file_id, args.flags)?;
 
             if args.flags & O_TRUNC as u32 != 0 {
+                debug!("truncating file");
                 fh.truncate(op_ctx)?;
             }
 
             let id = self.create_handle(fh);
+            debug!("file created/opened with handle {}", id);
 
             Ok((entry, Some(id), OpenOptions::empty(), None))
         })
@@ -1262,8 +1428,12 @@ where
         _lock_owner: Option<u64>,
         _flags: u32,
     ) -> io::Result<usize> {
+        let _span = debug_span!("read", inode, handle, size, offset).entered();
+
         self.with_context_and_handle_read(inode, handle, |op_ctx, fh| {
-            fh.read(op_ctx, size as size_t, offset as off_t, w)
+            let bytes_read = fh.read(op_ctx, size as size_t, offset as off_t, w)?;
+            debug!("read {} bytes at offset {}", bytes_read, offset);
+            Ok(bytes_read)
         })
     }
 
@@ -1280,41 +1450,62 @@ where
         flags: u32,
         _fuse_flags: u32,
     ) -> io::Result<usize> {
+        let is_append = flags & libc::O_APPEND as u32 != 0;
+        let _span = debug_span!("write", inode, handle, size, offset, append = is_append).entered();
+
         self.with_context_and_handle_write(inode, handle, |op_ctx, fh| {
-            if flags & libc::O_APPEND as u32 != 0 {
-                fh.append(op_ctx, size as size_t, r)
+            let bytes_written = if is_append {
+                debug!("appending {} bytes", size);
+                fh.append(op_ctx, size as size_t, r)?
             } else {
-                fh.write(op_ctx, size as size_t, offset as off_t, r)
-            }
+                debug!("writing {} bytes at offset {}", size, offset);
+                fh.write(op_ctx, size as size_t, offset as off_t, r)?
+            };
+            debug!("wrote {} bytes", bytes_written);
+            Ok(bytes_written)
         })
     }
 
     fn flush(
         &self,
         _ctx: &Context,
-        _inode: Self::Inode,
+        inode: Self::Inode,
         handle: Self::Handle,
         _lock_owner: u64,
     ) -> io::Result<()> {
+        let _span = debug_span!("flush", inode, handle).entered();
+        info!("🔄 FLUSH: Flushing handle {} for inode {}", handle, inode);
+
         if handle == 0 {
             return Ok(());
         }
 
         self.with_context(|op_ctx| {
-            self.with_handle_mut(handle, |fh| fh.flush(op_ctx))?
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "Invalid handle (flush)")
-                })?
+            self.with_handle_mut(handle, |fh| {
+                fh.flush(op_ctx)?;
+                info!(
+                    "✅ FLUSH: Successfully flushed handle {} for inode {}",
+                    handle, inode
+                );
+                Ok(())
+            })?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid handle (flush)"))?
         })
     }
 
     fn fsync(
         &self,
         _ctx: &Context,
-        _inode: Self::Inode,
+        inode: Self::Inode,
         datasync: bool,
         handle: Self::Handle,
     ) -> io::Result<()> {
+        let _span = debug_span!("fsync", inode, handle, datasync).entered();
+        info!(
+            "💾 FSYNC: Syncing handle {} for inode {} (datasync={})",
+            handle, inode, datasync
+        );
+
         if handle == 0 {
             return Ok(());
         }
@@ -1322,21 +1513,21 @@ where
         self.with_context(|op_ctx| {
             self.with_handle_mut(handle, |fh| {
                 if datasync {
+                    info!("💾 FSYNC: Syncing data for inode {}", inode);
                     fh.fsync_data(op_ctx)?;
                 }
+                info!("💾 FSYNC: Syncing metadata for inode {}", inode);
                 fh.fsync_metadata(op_ctx)?;
+                info!(
+                    "✅ FSYNC: Successfully synced handle {} for inode {}",
+                    handle, inode
+                );
                 Ok(())
             })?
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid handle (fsync)"))?
         })
     }
 
-    /// Our fallocate implementation does not really respect the standard
-    /// because we have no intent of managing the actual layout of the disk
-    /// and this is entirely a call to manage the layout of the dis. Best we
-    /// can do is pretend the file is bigger (even though it isn't). We could
-    /// probably zero-fill to "reserve" the space but that'd be long and stupid
-    /// and I don't see any need to do this for the use-case.
     fn fallocate(
         &self,
         _ctx: &Context,
@@ -1346,6 +1537,8 @@ where
         offset: u64,
         length: u64,
     ) -> io::Result<()> {
+        let _span = debug_span!("fallocate", inode, handle, mode, offset, length).entered();
+
         if mode != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -1354,6 +1547,7 @@ where
         }
 
         let new_size = offset + length;
+        debug!("fallocate: extending file to size {}", new_size);
 
         self.with_context_and_handle(inode, Some(handle), 0, |op_ctx, fh| {
             // Get current size
@@ -1361,7 +1555,13 @@ where
 
             // If the new size is larger than current size, extend the file
             if new_size > current_size {
+                debug!("extending file from {} to {}", current_size, new_size);
                 fh.set_size(op_ctx, new_size as off_t)?;
+            } else {
+                debug!(
+                    "file already large enough ({} >= {})",
+                    current_size, new_size
+                );
             }
 
             Ok(())
@@ -1371,34 +1571,52 @@ where
     fn release(
         &self,
         _ctx: &Context,
-        _inode: Self::Inode,
-        _flags: u32,
+        inode: Self::Inode,
+        flags: u32,
         handle: Self::Handle,
         flush: bool,
         _flock_release: bool,
         _lock_owner: Option<u64>,
     ) -> io::Result<()> {
+        let _span = debug_span!(
+            "release",
+            inode,
+            handle,
+            flags = format!("{:#x}", flags),
+            flush
+        )
+        .entered();
+        debug!("releasing handle {} for inode {}", handle, inode);
+
         if handle == 0 {
             return Ok(());
         }
 
         // If flush is requested, flush the handle first
         if flush {
+            info!("🔄 RELEASE: Flushing before release for handle {}", handle);
             self.with_context(|op_ctx| {
-                self.with_handle_mut(handle, |fh| fh.flush(op_ctx))?
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid handle"))?
+                self.with_handle_mut(handle, |fh| {
+                    fh.flush(op_ctx)?;
+                    info!("✅ RELEASE: Flush completed for handle {}", handle);
+                    Ok(())
+                })?
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid handle"))?
             })?;
         }
 
         // Remove the handle from our map
         self.remove_handle(handle);
+        debug!("handle {} released successfully", handle);
 
         Ok(())
     }
 
-    fn statfs(&self, _ctx: &Context, _inode: Self::Inode) -> io::Result<statvfs64> {
+    fn statfs(&self, _ctx: &Context, inode: Self::Inode) -> io::Result<statvfs64> {
+        let _span = debug_span!("statfs", inode).entered();
+
         self.with_context(|op_ctx| {
-            let mut stat: statvfs64 = unsafe { mem::zeroed() };
+            let mut stat: statvfs64 = unsafe { zeroed() };
 
             let block_size = self.fs.block_size()?;
             let used_storage = self.fs.estimate_used_storage()?;
@@ -1414,6 +1632,15 @@ where
             stat.f_ffree = self.fs.max_files_count(op_ctx)? - stat.f_files;
             stat.f_namemax = self.fs.get_name_max_size(op_ctx)?;
 
+            debug!(
+                "filesystem stats: {} blocks ({} bytes), {} free, {} files, {} max files",
+                stat.f_blocks,
+                stat.f_blocks * block_size as u64,
+                stat.f_bfree,
+                stat.f_files,
+                stat.f_files + stat.f_ffree
+            );
+
             Ok(stat)
         })
     }
@@ -1426,6 +1653,9 @@ where
         value: &[u8],
         flags: u32,
     ) -> io::Result<()> {
+        let attr_name = name.to_string_lossy();
+        let _span = debug_span!("setxattr", inode, name = %attr_name, size = value.len(), flags = format!("{:#x}", flags)).entered();
+
         const XATTR_CREATE: u32 = 1;
         const XATTR_REPLACE: u32 = 2;
 
@@ -1443,6 +1673,12 @@ where
         if flags != 0 && flags != XATTR_CREATE && flags != XATTR_REPLACE {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "Invalid flags"));
         }
+
+        debug!(
+            "setting extended attribute '{}' with {} bytes",
+            name_str,
+            value.len()
+        );
 
         self.with_context_and_handle(inode, None, libc::O_WRONLY as u32, |ctx, fh| {
             if flags == XATTR_CREATE {
@@ -1472,7 +1708,9 @@ where
                 }
             }
 
-            fh.xattr_set(ctx, name_str, value)
+            fh.xattr_set(ctx, name_str, value)?;
+            debug!("extended attribute '{}' set successfully", name_str);
+            Ok(())
         })
     }
 
@@ -1483,6 +1721,9 @@ where
         name: &CStr,
         size: u32,
     ) -> io::Result<GetxattrReply> {
+        let attr_name = name.to_string_lossy();
+        let _span = debug_span!("getxattr", inode, name = %attr_name, size).entered();
+
         let name_str = name
             .to_str()
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Invalid UTF-8"))?;
@@ -1497,6 +1738,11 @@ where
         self.with_context_and_handle(inode, None, libc::O_RDONLY as u32, |ctx, fh| {
             match fh.xattr_get(ctx, name_str) {
                 Ok(value) => {
+                    debug!(
+                        "found extended attribute '{}' with {} bytes",
+                        name_str,
+                        value.len()
+                    );
                     if size == 0 {
                         Ok(GetxattrReply::Count(value.len() as u32))
                     } else if (size as usize) < value.len() {
@@ -1519,13 +1765,22 @@ where
         inode: Self::Inode,
         size: u32,
     ) -> io::Result<ListxattrReply> {
+        let _span = debug_span!("listxattr", inode, size).entered();
+
         self.with_context_and_handle(inode, None, libc::O_RDONLY as u32, |ctx, fh| {
             let names = fh.xattr_list(ctx)?;
             let total_size: usize = names.iter().map(|name| name.len() + 1).sum();
 
+            debug!(
+                "found {} extended attributes, total size {}",
+                names.len(),
+                total_size
+            );
+
             if size == 0 {
                 Ok(ListxattrReply::Count(total_size as u32))
             } else if (size as usize) < total_size {
+                debug!("buffer too small: need {}, got {}", total_size, size);
                 Err(io::Error::from_raw_os_error(libc::ENODATA))
             } else {
                 let mut buffer = Vec::with_capacity(total_size);
@@ -1539,6 +1794,9 @@ where
     }
 
     fn removexattr(&self, _ctx: &Context, inode: Self::Inode, name: &CStr) -> io::Result<()> {
+        let attr_name = name.to_string_lossy();
+        let _span = debug_span!("removexattr", inode, name = %attr_name).entered();
+
         let name_str = name
             .to_str()
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Invalid UTF-8"))?;
@@ -1550,8 +1808,12 @@ where
             ));
         }
 
+        debug!("removing extended attribute '{}'", name_str);
+
         self.with_context_and_handle(inode, None, libc::O_WRONLY as u32, |ctx, fh| {
-            fh.xattr_remove(ctx, name_str)
+            fh.xattr_remove(ctx, name_str)?;
+            debug!("extended attribute '{}' removed successfully", name_str);
+            Ok(())
         })
     }
 
@@ -1561,6 +1823,8 @@ where
         inode: Self::Inode,
         flags: u32,
     ) -> io::Result<(Option<Self::Handle>, OpenOptions)> {
+        let _span = debug_span!("opendir", inode, flags = format!("{:#x}", flags)).entered();
+
         self.with_context(|op_ctx| {
             {
                 let mut tree = self.fs.tree(op_ctx)?;
@@ -1578,6 +1842,7 @@ where
             // Open a handle for the directory
             let fh = self.fs.open(op_ctx, inode, flags)?;
             let handle_id = self.create_handle(fh);
+            debug!("opened directory with handle {}", handle_id);
 
             Ok((Some(handle_id), OpenOptions::empty()))
         })
@@ -1592,6 +1857,8 @@ where
         offset: u64,
         add_entry: &mut dyn FnMut(DirEntry) -> io::Result<usize>,
     ) -> io::Result<()> {
+        let _span = debug_span!("readdir", inode, handle, size, offset).entered();
+
         let entries = self.inner_readdir(ctx, inode, handle, size, offset)?;
 
         for (owned_dir_entry, _) in entries {
@@ -1612,6 +1879,8 @@ where
         offset: u64,
         add_entry: &mut dyn FnMut(DirEntry, Entry) -> io::Result<usize>,
     ) -> io::Result<()> {
+        let _span = debug_span!("readdirplus", inode, handle, size, offset).entered();
+
         let entries = self.inner_readdir(ctx, inode, handle, size, offset)?;
 
         for (owned_dir_entry, entry) in entries {
@@ -1634,37 +1903,165 @@ where
         datasync: bool,
         handle: Self::Handle,
     ) -> io::Result<()> {
-        self.fsync(ctx, inode, datasync, handle)
+        let _span = debug_span!("fsyncdir", inode, handle, datasync).entered();
+        info!(
+            "💾 FSYNCDIR: Syncing directory handle {} for inode {} (datasync={})",
+            handle, inode, datasync
+        );
+
+        let result = self.fsync(ctx, inode, datasync, handle);
+        if result.is_ok() {
+            info!(
+                "✅ FSYNCDIR: Successfully synced directory handle {}",
+                handle
+            );
+        }
+        result
     }
 
     fn releasedir(
         &self,
         _ctx: &Context,
-        _inode: Self::Inode,
-        _flags: u32,
+        inode: Self::Inode,
+        flags: u32,
         handle: Self::Handle,
     ) -> io::Result<()> {
+        let _span =
+            debug_span!("releasedir", inode, handle, flags = format!("{:#x}", flags)).entered();
+        debug!("releasing directory handle {} for inode {}", handle, inode);
+
         if handle == 0 {
             return Ok(());
         }
 
         self.remove_handle(handle);
+        debug!("directory handle {} released successfully", handle);
 
         Ok(())
     }
 
-    /// We might implement special features through ioctl but for now we just
-    /// will tell the upper layer to stick it
+    fn lseek(
+        &self,
+        _ctx: &Context,
+        inode: Self::Inode,
+        handle: Self::Handle,
+        offset: u64,
+        whence: u32,
+    ) -> io::Result<u64> {
+        let _span = debug_span!("lseek", inode, handle, offset, whence).entered();
+
+        const SEEK_SET: u32 = 0;
+        const SEEK_CUR: u32 = 1;
+        const SEEK_END: u32 = 2;
+        const SEEK_DATA: u32 = 3;
+        const SEEK_HOLE: u32 = 4;
+
+        self.with_context(|op_ctx| {
+            // Get the file size - we'll need it for SEEK_END
+            let file_size = if handle != 0 {
+                // If we have a handle, use it
+                self.with_handle(handle, |fh| {
+                    fh.get_inode().make_entry().map(|core| core.st_size)
+                })?
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid handle"))?
+            } else {
+                // Otherwise, get the inode directly
+                let mut tree = self.fs.tree(op_ctx)?;
+                let inode_obj = tree.get_inode(inode)?;
+                Ok(inode_obj.make_entry()?.st_size)
+            }?;
+
+            let new_offset = match whence {
+                SEEK_SET => {
+                    // Direct offset from beginning of file
+                    debug!("SEEK_SET to offset {}", offset);
+                    offset as i64
+                }
+                SEEK_CUR => {
+                    // In FUSE, there's no "current position" maintained by the
+                    // kernel, the offset parameter already contains the
+                    // desired absolute position
+                    debug!("SEEK_CUR with offset {}", offset);
+                    offset as i64
+                }
+                SEEK_END => {
+                    // Offset from end of file
+                    let new_pos = file_size as i64 + offset as i64;
+                    debug!(
+                        "SEEK_END: file_size={}, offset={}, new_pos={}",
+                        file_size, offset as i64, new_pos
+                    );
+                    new_pos
+                }
+                SEEK_DATA => {
+                    // Since we don't have holes, any offset within the file is
+                    // data
+                    debug!("SEEK_DATA from offset {}", offset);
+                    if offset >= file_size as u64 {
+                        // Beyond EOF, no data
+                        return Err(io::Error::from_raw_os_error(libc::ENXIO));
+                    }
+                    // Otherwise, the offset itself is the next data position
+                    offset as i64
+                }
+                SEEK_HOLE => {
+                    // Since we don't have holes, the only "hole" is beyond EOF
+                    debug!("SEEK_HOLE from offset {}", offset);
+                    if offset >= file_size as u64 {
+                        // Already beyond EOF
+                        return Err(io::Error::from_raw_os_error(libc::ENXIO));
+                    }
+                    // The next hole is at EOF
+                    file_size as i64
+                }
+                _ => {
+                    tracing::warn!("Unknown seek whence value: {}", whence);
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("Invalid whence value: {}", whence),
+                    ));
+                }
+            };
+
+            // Validate the new offset
+            if new_offset < 0 {
+                debug!("Seek would result in negative offset: {}", new_offset);
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Seek offset would be negative",
+                ));
+            }
+
+            debug!(
+                "lseek completed: whence={}, offset={}, file_size={}, new_offset={}",
+                whence, offset, file_size, new_offset
+            );
+
+            Ok(new_offset as u64)
+        })
+    }
+
     fn ioctl(
         &self,
         _ctx: &Context,
-        _inode: Self::Inode,
-        _handle: Self::Handle,
-        _flags: u32,
-        _cmd: u32,
+        inode: Self::Inode,
+        handle: Self::Handle,
+        flags: u32,
+        cmd: u32,
         _data: IoctlData,
-        _out_size: u32,
+        out_size: u32,
     ) -> io::Result<IoctlData> {
+        let _span = debug_span!(
+            "ioctl",
+            inode,
+            handle,
+            flags = format!("{:#x}", flags),
+            cmd = format!("{:#x}", cmd),
+            out_size
+        )
+        .entered();
+
+        debug!("There is no IO to CTL, this is not a TTY");
         Err(io::Error::from_raw_os_error(libc::ENOTTY))
     }
 }
