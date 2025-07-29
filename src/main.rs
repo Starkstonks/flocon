@@ -3,15 +3,18 @@ use clap::{Parser, Subcommand, ValueEnum};
 use fuse_backend_rs::api::server::Server;
 use fuse_backend_rs::transport::FuseSession;
 use nix::mount::MsFlags;
-use std::sync::Arc;
 use std::sync::mpsc::channel;
+use std::sync::Arc;
 use std::{num::ParseIntError, path::PathBuf, thread};
-use tracing::{Level, error, info};
+use std::time::Duration;
+use tracing::{error, info, Level};
 use tracing_subscriber;
 
 mod filesystem;
+mod virtiofs;
 
 use crate::filesystem::{FileSystemManager, Flocon, WinterFsHandler};
+use crate::virtiofs::run_virtiofs_daemon; // Import the daemon runner
 
 #[derive(Parser)]
 #[command(author, version, about, color = clap::ColorChoice::Auto)]
@@ -74,6 +77,33 @@ enum Commands {
         /// Run in background.
         #[arg(long, action, default_value_t = false)]
         daemonize: bool,
+    },
+
+    /// Exposes the filesystem via virtio-fs vhost-user.
+    Virtiofs {
+        /// Image file path
+        #[arg(value_name = "IMAGE", value_parser = parse_existing_file)]
+        image: PathBuf,
+
+        /// vhost-user socket path
+        #[arg(value_name = "SOCKET")]
+        socket: PathBuf,
+
+        /// Root dir permissions (octal, e.g. 755)
+        #[arg(long, value_parser = parse_octal, default_value = "755")]
+        mode: u32,
+
+        /// Root dir owner UID
+        #[arg(long, default_value_t = 0)]
+        uid: u32,
+
+        /// Root dir owner GID
+        #[arg(long, default_value_t = 0)]
+        gid: u32,
+
+        /// Verbosity for application logging.
+        #[arg(long, value_enum, default_value_t = LogLevel::Info)]
+        log_level: LogLevel,
     },
 }
 
@@ -219,12 +249,71 @@ fn flocon_mount(
     Ok(())
 }
 
+fn flocon_virtiofs(image: PathBuf, socket: PathBuf, mode: u32, uid: u32, gid: u32) -> Result<()> {
+    info!("Exposing filesystem via virtiofs:");
+    info!("  Image: {:?}", image);
+    info!("  Socket: {:?}", socket);
+    info!("  Mode: {:o}, UID: {}, GID: {}", mode, uid, gid);
+
+    let fs_manager = FileSystemManager::new(&image, mode, uid, gid)?;
+    let fs = WinterFsHandler::new(Flocon::new(fs_manager, &image));
+    let fs_arc = Arc::new(fs);
+    let server = Arc::new(Server::new(fs_arc));
+
+    let (tx, rx) = channel();
+    ctrlc::set_handler(move || {
+        tx.send(()).expect("Could not send signal on channel.");
+    })?;
+
+    let virtiofs_handle = run_virtiofs_daemon(socket, server)?;
+
+    info!("Virtiofs daemon started. Waiting for Ctrl-C to stop...");
+    rx.recv()?;
+
+    info!("Shutdown requested, stopping virtiofs daemon...");
+    // The daemon thread will be terminated when the main process exits.
+    // For a more graceful shutdown, you might need to implement a mechanism
+    // to signal the daemon thread to stop, for example by using its kill_evt.
+    // For now, we'll just wait for it briefly.
+    // Note: A robust implementation would involve a more graceful shutdown mechanism.
+    if let Err(e) = virtiofs_handle.join_timeout(Duration::from_secs(1)) {
+        error!("Virtiofs daemon thread did not exit cleanly: {:?}", e);
+    }
+
+    info!("Virtiofs daemon stopped.");
+    Ok(())
+}
+
+// Extension trait to allow joining with a timeout.
+trait JoinTimeout {
+    fn join_timeout(self, timeout: std::time::Duration) -> std::result::Result<(), String>;
+}
+
+impl<T> JoinTimeout for thread::JoinHandle<T> {
+    fn join_timeout(self, timeout: std::time::Duration) -> std::result::Result<(), String> {
+        let _handle_thread = self.thread().clone();
+        let start = std::time::Instant::now();
+        while !self.is_finished() {
+            if start.elapsed() > timeout {
+                return Err("timed out".to_string());
+            }
+            std::thread::yield_now();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+
+        self.join()
+            .map_err(|e| format!("thread panicked: {:?}", e))?;
+        Ok(())
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
 
     let log_level = match &cli.command {
         Commands::Mkfs { log_level, .. } => log_level.clone(),
         Commands::Mount { log_level, .. } => log_level.clone(),
+        Commands::Virtiofs { log_level, .. } => log_level.clone(),
     };
 
     let level: Level = log_level.into();
@@ -248,6 +337,14 @@ fn main() {
             daemonize,
             ..
         } => flocon_mount(image, mount_point, mode, uid, gid, daemonize),
+        Commands::Virtiofs {
+            image,
+            socket,
+            mode,
+            uid,
+            gid,
+            ..
+        } => flocon_virtiofs(image, socket, mode, uid, gid),
     };
 
     if let Err(e) = result {
