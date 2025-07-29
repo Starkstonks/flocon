@@ -37,26 +37,36 @@ Flocon addresses these issues by:
 
 ## Current State
 
-Flocon is in early development and currently supports:
+Flocon is in active development. The core engine is functional and supports a
+wide range of POSIX features.
 
--   ✅ Basic FUSE filesystem operations (create, read, write, delete files and
-    directories)
--   ✅ File metadata (permissions, ownership, timestamps)
--   ✅ Efficient block-based storage with automatic deduplication of zero blocks
--   ✅ SQLite-based storage with transaction support
--   ✅ Command-line tools for creating and mounting filesystems
--   ✅ Extended attributes (xattr)
--   ✅ Symbolic links
--   ✅ Special files (devices, sockets, FIFOs)
+**Implemented Features:**
 
-Not yet implemented:
+-   ✅ Basic filesystem operations (create, read, write, delete files and
+    directories).
+-   ✅ File metadata (permissions, ownership, timestamps).
+-   ✅ Efficient block-based storage with automatic optimization for zero-filled
+    blocks.
+-   ✅ Transactional integrity for all operations via SQLite.
+-   ✅ **FUSE mount support** for use on a host system.
+-   ✅ **Virtio-fs vhost-user backend** for high-performance use with VMs (e.g.,
+    QEMU, Firecracker).
+-   ✅ **Extended attributes (xattr)** support.
+-   ✅ **Symbolic links**.
+-   ✅ **Special files** (e.g., device files via `mknod`).
+-   ✅ Command-line tools for creating, mounting, and serving filesystems.
 
--   ❌ Multi-layer support (combining multiple SQLite files)
--   ❌ virtiofs server mode
+**Future Work:**
+
+-   ❌ **Multi-layer support**: The main architectural goal is to support
+    mounting multiple SQLite files as a single, unified filesystem, which is not
+    yet implemented.
 
 ## Installation
 
 ### Building from Source
+
+You'll need the Rust toolchain and standard build tools.
 
 ```bash
 git clone https://github.com/Starkstonks/flocon
@@ -68,79 +78,96 @@ The binary will be available at `target/release/flocon`.
 
 ## Usage
 
-### Creating a New Filesystem
+### 1. Creating a New Filesystem
+
+Create a new Flocon filesystem image, which is a standard SQLite file.
 
 ```bash
-# Create a new Flocon filesystem image
-flocon mkfs myfilesystem.db
+# Create a new filesystem image with default permissions
+./target/release/flocon mkfs myfilesystem.db
 
 # With custom root directory permissions and ownership
-flocon mkfs myfilesystem.db --mode 755 --uid 1000 --gid 1000
+./target/release/flocon mkfs myfilesystem.db --mode 755 --uid 1000 --gid 1000
 ```
 
-### Mounting a Filesystem
+### 2. Mounting a Filesystem (FUSE)
+
+Mount the filesystem on your local machine using FUSE.
 
 ```bash
+# Create a mount point
+mkdir -p /mnt/flocon
+
 # Mount the filesystem
-flocon mount myfilesystem.db /mnt/flocon
+./target/release/flocon mount myfilesystem.db /mnt/flocon
 
-# With custom permissions
-flocon mount myfilesystem.db /mnt/flocon --mode 755 --uid 1000 --gid 1000
-
-# Run in background (daemon mode)
-flocon mount myfilesystem.db /mnt/flocon --daemonize
+# Mount and run in the background (daemon mode)
+./target/release/flocon mount myfilesystem.db /mnt/flocon --daemonize
 ```
 
-### Unmounting
+The filesystem can be unmounted using standard tools
+(`fusermount -u /mnt/flocon` on Linux) or by pressing `Ctrl+C` if running in the
+foreground.
 
-The filesystem can be unmounted using standard FUSE tools:
+### 3. Exposing a Filesystem (Virtio-fs)
+
+Expose the filesystem to a virtual machine over a vhost-user socket. This is
+ideal for container runtimes or custom VM setups.
 
 ```bash
-# Linux
-fusermount -u /mnt/flocon
-
-# macOS
-umount /mnt/flocon
+# Run the virtiofs server, listening on a socket
+./target/release/flocon virtiofs myfilesystem.db /tmp/flocon.sock
 ```
 
-Or by pressing `Ctrl+C` if running in foreground mode.
+You can then configure your VMM (e.g., QEMU) to connect to `/tmp/flocon.sock` to
+provide the filesystem to the guest.
 
 ### Logging
 
-Control the verbosity of logging output:
+Control the verbosity of logging output for any command:
 
 ```bash
-flocon mount myfilesystem.db /mnt/flocon --log-level debug
+# See detailed debug information
+./target/release/flocon mount myfilesystem.db /mnt/flocon --log-level debug
 ```
 
-Available log levels: `trace`, `debug`, `info`, `warn`, `error`
+Available log levels: `trace`, `debug`, `info`, `warn`, `error`.
 
 ## Architecture
 
-Flocon uses a simple but efficient schema:
+Flocon is built on two key components: a generic filesystem abstraction and a
+concrete SQLite implementation.
 
--   **Inodes**: Store file metadata (permissions, timestamps, size)
--   **Blocks**: Store actual file data in 1MB chunks with automatic zero-block
-    optimization
--   **Links**: Implement the directory structure (parent-child relationships)
--   **Extended attributes**: (Planned) Store additional metadata
+-   **WinterFS Abstraction**: A custom trait-based system (`WinterFs`,
+    `WinterInode`, `WinterHandle`) that defines a clean interface for filesystem
+    operations, separating the core logic from the FUSE or virtio-fs protocol
+    details.
+-   **SQLite Backend**: The storage is a SQLite database with a simple schema:
+    -   `inode`: Stores file metadata (mode, UID, GID, timestamps, size).
+    -   `block`: Stores actual file data in chunks. Zero-filled blocks are
+        stored implicitly to save space.
+    -   `link`: Implements the directory tree by linking parent inodes to child
+        inodes with a name.
+    -   `xattr`: Stores extended attributes for inodes.
 
-The filesystem is transactional - all operations either complete successfully or
-are rolled back entirely, ensuring consistency even in case of crashes.
+All operations are wrapped in SQLite transactions, ensuring the filesystem
+remains consistent. The database runs in `WAL` (Write-Ahead Logging) mode for
+improved concurrency and performance.
 
 ## Performance Considerations
 
 Flocon is optimized for:
 
--   Fast reads of small files (common in containers)
--   Efficient storage through block deduplication
--   Quick metadata operations through SQLite indices
+-   Fast reads of many small files.
+-   Efficient metadata lookups via SQLite indices.
+-   Low storage overhead for sparse files or files with large zero-filled
+    sections.
 
 Trade-offs:
 
--   Write performance may be slower than traditional filesystems
--   Not optimized for large sequential writes
--   Some POSIX features may have different performance characteristics
+-   Write performance for large, sequential files may be slower than traditional
+    filesystems due to the overhead of database transactions.
+-   It is not yet optimized for workloads with very high write concurrency.
 
 ## Future Vision
 
@@ -158,14 +185,19 @@ The goal is to enable workflows like:
 ## Contributing
 
 Flocon is an experimental project exploring new approaches to container
-filesystems. Contributions, ideas, and feedback are welcome!
+filesystems. Contributions, ideas, and feedback are highly welcome!
 
 ## Acknowledgments
 
-Built with:
+Built with an amazing stack of Rust crates:
 
 -   [fuse-backend-rs](https://github.com/cloud-hypervisor/fuse-backend-rs) for
-    FUSE integration
--   [Diesel](https://diesel.rs/) for SQLite ORM
--   [SQLite](https://www.sqlite.org/) for the storage engine
--   [Rust](https://www.rust-lang.org/) 2024 edition
+    FUSE and virtio-fs integration.
+-   [rusqlite](https://github.com/rusqlite/rusqlite) for direct,
+    high-performance SQLite access.
+-   [SQLite](https://www.sqlite.org/) as the rock-solid storage engine.
+-   [Clap](https://crates.io/crates/clap) for powerful command-line argument
+    parsing.
+-   [Tracing](https://crates.io/crates/tracing) for structured, level-based
+    logging.
+-   Built with the [Rust](https://www.rust-lang.org/) 2024 edition.
