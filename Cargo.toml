@@ -2,6 +2,10 @@
 name = "flocon"
 version = "0.1.0"
 edition = "2024"
+license-file = "LICENSE"
+description = "A high-performance, SQLite-based filesystem designed specifically for containers and modern deployment workflows."
+repository = "https://github.com/Starkstonks/flocon"
+homepage = "https://github.com/Starkstonks/flocon"
 
 [dependencies]
 anyhow = "1.0"
