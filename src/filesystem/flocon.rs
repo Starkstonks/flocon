@@ -1,4 +1,6 @@
-use crate::filesystem::blocks::{MemoryDataSource, Sequence, SqliteDataSource, WorkingBlock};
+use crate::filesystem::blocks::{
+    DataSource, MemoryDataSource, Sequence, SqliteDataSource, WorkingBlock, ZeroDataSource,
+};
 use crate::filesystem::sqlite::FileSystemManager;
 use crate::filesystem::winter::{WinterFs, WinterInode, WinterTree};
 use crate::filesystem::{EntryCore, WinterHandle};
@@ -487,7 +489,7 @@ impl WinterHandle for FloconHandle {
                 .conn
                 .prepare(
                     r#"
-                    select id, inode_id, first_byte, last_byte
+                    select id, inode_id, first_byte, last_byte, data is not null as has_data
                     from block
                     where inode_id = ? and first_byte < ? and last_byte >= ?
                     "#,
@@ -502,7 +504,11 @@ impl WinterHandle for FloconHandle {
                         let first_byte: u64 = row.get(2)?;
                         let last_byte: u64 = row.get(3)?;
                         let size: u64 = last_byte - first_byte + 1;
-                        let source = Box::new(SqliteDataSource::new(id, 0, size));
+                        let source: Box<dyn DataSource> = if row.get(4)? {
+                            Box::new(SqliteDataSource::new(id, 0, size))
+                        } else {
+                            Box::new(ZeroDataSource::new(size))
+                        };
 
                         Ok(WorkingBlock {
                             id: Some(id),
@@ -663,7 +669,7 @@ impl WinterHandle for FloconHandle {
                 .conn
                 .prepare(
                     r#"
-                    select id, first_byte, last_byte
+                    select id, first_byte, last_byte, data is not null as has_data
                     from block
                     where inode_id = ? and last_byte >= ? and first_byte <= ?
                     order by first_byte asc
@@ -676,7 +682,11 @@ impl WinterHandle for FloconHandle {
                 let first_byte: u64 = row.get(1)?;
                 let last_byte: u64 = row.get(2)?;
                 let size: u64 = last_byte - first_byte + 1;
-                let source = Box::new(SqliteDataSource::new(id, 0, size));
+                let source: Box<dyn DataSource> = if row.get(3)? {
+                    Box::new(SqliteDataSource::new(id, 0, size))
+                } else {
+                    Box::new(ZeroDataSource::new(size))
+                };
 
                 Ok(WorkingBlock {
                     id: Some(id),
@@ -727,7 +737,7 @@ impl WinterHandle for FloconHandle {
             .conn
             .prepare(
                 r#"
-                select id, first_byte, last_byte
+                select id, first_byte, last_byte, data is not null as has_data
                 from block
                 where inode_id = ? and last_byte >= ? and first_byte <= ?
                 order by first_byte asc
@@ -741,7 +751,11 @@ impl WinterHandle for FloconHandle {
                 let first_byte: u64 = row.get(1)?;
                 let last_byte: u64 = row.get(2)?;
                 let size: u64 = last_byte - first_byte + 1;
-                let source = Box::new(SqliteDataSource::new(id, 0, size));
+                let source: Box<dyn DataSource> = if row.get(3)? {
+                    Box::new(SqliteDataSource::new(id, 0, size))
+                } else {
+                    Box::new(ZeroDataSource::new(size))
+                };
 
                 Ok(WorkingBlock {
                     id: Some(id),
