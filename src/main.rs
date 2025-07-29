@@ -3,11 +3,11 @@ use clap::{Parser, Subcommand, ValueEnum};
 use fuse_backend_rs::api::server::Server;
 use fuse_backend_rs::transport::FuseSession;
 use nix::mount::MsFlags;
-use std::sync::mpsc::channel;
 use std::sync::Arc;
-use std::{num::ParseIntError, path::PathBuf, thread};
+use std::sync::mpsc::channel;
 use std::time::Duration;
-use tracing::{error, info, Level};
+use std::{num::ParseIntError, path::PathBuf, thread};
+use tracing::{Level, error, info};
 use tracing_subscriber;
 
 mod filesystem;
@@ -286,19 +286,19 @@ fn flocon_virtiofs(image: PathBuf, socket: PathBuf, mode: u32, uid: u32, gid: u3
 
 // Extension trait to allow joining with a timeout.
 trait JoinTimeout {
-    fn join_timeout(self, timeout: std::time::Duration) -> std::result::Result<(), String>;
+    fn join_timeout(self, timeout: Duration) -> std::result::Result<(), String>;
 }
 
 impl<T> JoinTimeout for thread::JoinHandle<T> {
-    fn join_timeout(self, timeout: std::time::Duration) -> std::result::Result<(), String> {
+    fn join_timeout(self, timeout: Duration) -> std::result::Result<(), String> {
         let _handle_thread = self.thread().clone();
         let start = std::time::Instant::now();
         while !self.is_finished() {
             if start.elapsed() > timeout {
                 return Err("timed out".to_string());
             }
-            std::thread::yield_now();
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            thread::yield_now();
+            thread::sleep(Duration::from_millis(100));
         }
 
         self.join()

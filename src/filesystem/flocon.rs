@@ -387,6 +387,52 @@ impl FloconHandle {
 
         Ok(())
     }
+
+    /// Fetch working blocks for a given inode within a byte range
+    #[inline]
+    fn fetch_working_blocks(
+        context: &mut FloconContext,
+        inode_id: u64,
+        start: u64,
+        end: u64,
+    ) -> std::io::Result<Vec<WorkingBlock>> {
+        let mut stmt = context
+            .conn
+            .prepare(
+                r#"
+                select id, first_byte, last_byte, data is not null as has_data
+                from block
+                where inode_id = ? and last_byte >= ? and first_byte <= ?
+                order by first_byte asc
+                "#,
+            )
+            .map_err(|e| Error::new(ErrorKind::Other, e))?;
+
+        let blocks = stmt
+            .query_map(params![inode_id, start, end], |row| {
+                let id: u64 = row.get(0)?;
+                let first_byte: u64 = row.get(1)?;
+                let last_byte: u64 = row.get(2)?;
+                let size: u64 = last_byte - first_byte + 1;
+                let source: Box<dyn DataSource> = if row.get(3)? {
+                    Box::new(SqliteDataSource::new(id, 0, size))
+                } else {
+                    Box::new(ZeroDataSource::new(size))
+                };
+
+                Ok(WorkingBlock {
+                    id: Some(id),
+                    first_byte,
+                    last_byte,
+                    source,
+                })
+            })
+            .map_err(|e| Error::new(ErrorKind::Other, e))?
+            .collect::<Result<Vec<WorkingBlock>, _>>()
+            .map_err(|e| Error::new(ErrorKind::Other, e))?;
+
+        Ok(blocks)
+    }
 }
 
 impl WinterHandle for FloconHandle {
@@ -664,41 +710,12 @@ impl WinterHandle for FloconHandle {
             return Ok(0);
         }
 
-        let working_blocks = {
-            let mut stmt = context
-                .conn
-                .prepare(
-                    r#"
-                    select id, first_byte, last_byte, data is not null as has_data
-                    from block
-                    where inode_id = ? and last_byte >= ? and first_byte <= ?
-                    order by first_byte asc
-                    "#,
-                )
-                .map_err(|e| Error::new(ErrorKind::Other, e))?;
-
-            stmt.query_map(params![current_inode_id, read_start, read_end], |row| {
-                let id: u64 = row.get(0)?;
-                let first_byte: u64 = row.get(1)?;
-                let last_byte: u64 = row.get(2)?;
-                let size: u64 = last_byte - first_byte + 1;
-                let source: Box<dyn DataSource> = if row.get(3)? {
-                    Box::new(SqliteDataSource::new(id, 0, size))
-                } else {
-                    Box::new(ZeroDataSource::new(size))
-                };
-
-                Ok(WorkingBlock {
-                    id: Some(id),
-                    first_byte,
-                    last_byte,
-                    source,
-                })
-            })
-            .map_err(|e| Error::new(ErrorKind::Other, e))?
-            .collect::<Result<Vec<WorkingBlock>, _>>()
-            .map_err(|e| Error::new(ErrorKind::Other, e))?
-        };
+        let working_blocks = Self::fetch_working_blocks(
+            context,
+            current_inode_id,
+            read_start as u64,
+            read_end as u64,
+        )?;
 
         let sequence = Sequence::new(working_blocks).clip(read_start as u64, read_end as u64);
         sequence.concrete_data_to_writer(context, w)
@@ -733,45 +750,15 @@ impl WinterHandle for FloconHandle {
             return Err(Error::new(ErrorKind::Other, "Unexpected EOF"));
         }
 
-        let mut stmt = context
-            .conn
-            .prepare(
-                r#"
-                select id, first_byte, last_byte, data is not null as has_data
-                from block
-                where inode_id = ? and last_byte >= ? and first_byte <= ?
-                order by first_byte asc
-                "#,
-            )
-            .map_err(|e| Error::new(ErrorKind::Other, e))?;
-
-        let working_blocks: Vec<WorkingBlock> = stmt
-            .query_map(params![current_inode_id, write_start, write_end], |row| {
-                let id: u64 = row.get(0)?;
-                let first_byte: u64 = row.get(1)?;
-                let last_byte: u64 = row.get(2)?;
-                let size: u64 = last_byte - first_byte + 1;
-                let source: Box<dyn DataSource> = if row.get(3)? {
-                    Box::new(SqliteDataSource::new(id, 0, size))
-                } else {
-                    Box::new(ZeroDataSource::new(size))
-                };
-
-                Ok(WorkingBlock {
-                    id: Some(id),
-                    first_byte,
-                    last_byte,
-                    source,
-                })
-            })
-            .map_err(|e| Error::new(ErrorKind::Other, e))?
-            .collect::<Result<Vec<WorkingBlock>, _>>()
-            .map_err(|e| Error::new(ErrorKind::Other, e))?;
+        let working_blocks = Self::fetch_working_blocks(
+            context,
+            current_inode_id,
+            write_start as u64,
+            write_end as u64,
+        )?;
 
         let original_block_ids: std::collections::HashSet<u64> =
             working_blocks.iter().filter_map(|b| b.id).collect();
-
-        drop(stmt);
 
         let mut sequence = Sequence::new(working_blocks);
 
@@ -899,8 +886,8 @@ impl WinterHandle for FloconHandle {
             let chunk_end = current_offset + chunk.len() as u64 - 1;
             working_blocks.push(WorkingBlock {
                 id: None,
-                first_byte: current_offset as u64,
-                last_byte: chunk_end as u64,
+                first_byte: current_offset,
+                last_byte: chunk_end,
                 source: Box::new(
                     MemoryDataSource::from_data(chunk.to_vec())
                         .expect("Failed to create MemoryDataSource"),
